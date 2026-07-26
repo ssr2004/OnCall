@@ -100,33 +100,28 @@ echo.
 REM 设置 Python 命令
 set PYTHON_CMD=.venv\Scripts\python.exe
 
-REM 启动 Docker Compose
-echo [4/6] 启动 Milvus 向量数据库...
-docker ps --format "{{.Names}}" | findstr "milvus-standalone" >nul 2>&1
-if not errorlevel 1 (
-    echo [信息] Milvus 容器已在运行
-) else (
-    docker compose -f vector-database.yml up -d
-    if errorlevel 1 (
-        echo [错误] Docker 启动失败，请确保 Docker Desktop 已启动
-        pause
-        exit /b 1
-    )
-    echo [信息] 等待 Milvus 启动（10秒）...
-    timeout /t 10 /nobreak >nul
+REM 启动 Docker Compose。up -d 是幂等操作，会保留未变化的已有容器并补齐新增服务。
+echo [4/8] 启动 Milvus 和 Prometheus 基础设施...
+docker compose -f vector-database.yml up -d
+if errorlevel 1 (
+    echo [错误] Docker 启动失败，请确保 Docker Desktop 和镜像网络可用
+    pause
+    exit /b 1
 )
-echo [成功] Milvus 数据库就绪
+echo [信息] 等待基础设施启动（10秒）...
+timeout /t 10 /nobreak >nul
+echo [成功] Milvus 和 Prometheus 基础设施已启动
 echo.
 
 REM 启动 CLS MCP 服务
-echo [5/6] 启动 CLS MCP 服务...
+echo [5/8] 启动 CLS MCP 服务...
 start "CLS MCP Server" /min %PYTHON_CMD% mcp_servers/cls_server.py
 timeout /t 2 /nobreak >nul
 echo [成功] CLS MCP 服务已启动
 echo.
 
 REM 启动 Monitor MCP 服务
-echo [6/6] 启动 Monitor MCP 服务...
+echo [6/8] 启动 Monitor MCP 服务...
 start "Monitor MCP Server" /min %PYTHON_CMD% mcp_servers/monitor_server.py
 timeout /t 2 /nobreak >nul
 echo [成功] Monitor MCP 服务已启动
@@ -164,6 +159,8 @@ echo 服务启动完成！
 echo ====================================
 echo Web 界面: http://localhost:9900
 echo API 文档: http://localhost:9900/docs
+echo Prometheus: http://localhost:9090
+echo Prometheus Targets: http://localhost:9090/targets
 echo.
 echo 查看日志:
 echo   - FastAPI: logs\app_*.log（Loguru 日志，按天轮转）

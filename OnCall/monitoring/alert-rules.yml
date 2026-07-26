@@ -1,0 +1,41 @@
+groups:
+  - name: oncall-host-alerts
+    rules:
+      - alert: MonitorTargetDown
+        expr: up{job="windows-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "监控目标不可用"
+          description: "windows_exporter 目标 {{ $labels.instance }} 已连续 1 分钟无法抓取。"
+
+      - alert: HighCPUUsage
+        expr: |
+          100 - (
+            avg by (instance, job, service, system, station) (
+              rate(windows_cpu_time_total{mode="idle"}[5m])
+            ) * 100
+          ) > 80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU 使用率持续过高"
+          description: "目标 {{ $labels.instance }} 的 CPU 使用率已连续 2 分钟超过 80%。"
+
+      - alert: HighMemoryUsage
+        expr: |
+          (
+            1 - (
+              windows_os_physical_memory_free_bytes
+              /
+              windows_cs_physical_memory_bytes
+            )
+          ) * 100 > 70
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率持续过高"
+          description: "目标 {{ $labels.instance }} 的内存使用率已连续 2 分钟超过 70%。"

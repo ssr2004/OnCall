@@ -136,53 +136,44 @@ up:
 		colima start 2>/dev/null || (echo "$(RED)❌ 无法启动 Docker，请手动启动$(NC)" && exit 1); \
 		sleep 3; \
 	fi
+	@echo "$(YELLOW)🚀 启动 Milvus 和 Prometheus 基础设施...$(NC)"
+	@docker compose -f vector-database.yml up -d
+	@echo "$(YELLOW)⏳ 等待容器启动...$(NC)"
+	@sleep 5
 	@if docker ps --format '{{.Names}}' | grep -q "^$(MILVUS_CONTAINER)$$"; then \
-		echo "$(GREEN)✅ Milvus 容器已经在运行中$(NC)"; \
-		docker ps --filter "name=milvus" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -10; \
+		echo "$(GREEN)✅ Docker 基础设施启动成功！$(NC)"; \
+		echo ""; \
+		docker compose -f vector-database.yml ps; \
+		echo ""; \
+		echo "$(GREEN)🌐 服务访问地址:$(NC)"; \
+		echo "   Milvus: localhost:19530"; \
+		echo "   Attu (Web UI): http://localhost:8000"; \
+		echo "   MinIO: http://localhost:9001 (admin/minioadmin)"; \
+		echo "   Prometheus: http://localhost:9090"; \
 	else \
-		echo "$(YELLOW)🚀 启动 Milvus 相关容器...$(NC)"; \
-		docker compose -f vector-database.yml up -d; \
-		echo "$(YELLOW)⏳ 等待容器启动...$(NC)"; \
-		sleep 5; \
-		if docker ps --format '{{.Names}}' | grep -q "^$(MILVUS_CONTAINER)$$"; then \
-			echo "$(GREEN)✅ Docker 容器启动成功！$(NC)"; \
-			echo ""; \
-			echo "$(GREEN)📋 运行中的容器:$(NC)"; \
-			docker ps --filter "name=milvus" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -10; \
-			echo ""; \
-			echo "$(GREEN)🌐 服务访问地址:$(NC)"; \
-			echo "   Milvus: localhost:19530"; \
-			echo "   Attu (Web UI): http://localhost:8000"; \
-			echo "   MinIO: http://localhost:9001 (admin/minioadmin)"; \
-		else \
-			echo "$(RED)❌ 容器启动失败$(NC)"; \
-			exit 1; \
-		fi; \
+		echo "$(RED)❌ 容器启动失败$(NC)"; \
+		exit 1; \
 	fi
 
 # 停止 Docker 容器
 down:
-	@echo "$(YELLOW)🛑 停止 Docker 容器...$(NC)"
-	@if docker ps --format '{{.Names}}' | grep -q "milvus"; then \
+	@echo "$(YELLOW)🛑 停止 Docker 基础设施...$(NC)"
+	@if [ -n "$$(docker compose -f vector-database.yml ps -aq)" ]; then \
 		docker compose -f vector-database.yml down; \
-		echo "$(GREEN)✅ Docker 容器已停止$(NC)"; \
+		echo "$(GREEN)✅ Docker 基础设施已停止$(NC)"; \
 	else \
-		echo "$(YELLOW)⚠️  没有运行中的 Milvus 容器$(NC)"; \
+		echo "$(YELLOW)⚠️  没有找到当前项目的 Docker 容器$(NC)"; \
 	fi
 
 # 查看容器状态
 status:
-	@echo "$(YELLOW)📊 Docker 容器状态:$(NC)"
+	@echo "$(YELLOW)📊 Docker 基础设施状态:$(NC)"
 	@echo ""
-	@if docker ps -a --format '{{.Names}}' | grep -q "milvus"; then \
-		docker ps -a --filter "name=milvus" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"; \
-		echo ""; \
-		running=$$(docker ps --filter "name=milvus" --format '{{.Names}}' | wc -l | tr -d ' '); \
-		total=$$(docker ps -a --filter "name=milvus" --format '{{.Names}}' | wc -l | tr -d ' '); \
-		echo "$(GREEN)运行中: $$running / $$total$(NC)"; \
+	@if [ -n "$$(docker compose -f vector-database.yml ps -aq)" ]; then \
+		docker compose -f vector-database.yml ps -a; \
 	else \
-		echo "$(YELLOW)⚠️  没有找到 Milvus 相关容器$(NC)"; \
-		echo "$(YELLOW)提示: 请先创建 Milvus 容器$(NC)"; \
+		echo "$(YELLOW)⚠️  没有找到当前项目的 Docker 容器$(NC)"; \
+		echo "$(YELLOW)提示: 请先执行 make up$(NC)"; \
 	fi
 
 # ============================================================

@@ -57,6 +57,23 @@ services:
     depends_on:
       - "etcd"
       - "minio"
+
+  prometheus:
+    container_name: oncall-prometheus
+    image: prom/prometheus:v2.54.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/prometheus:/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   # 这是新增的 Attu 服务哦！
   attu:
     container_name: milvus-attu

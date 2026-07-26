@@ -46,13 +46,17 @@ planner_prompt = ChatPromptTemplate.from_messages(
                 - 步骤之间应该有清晰的依赖关系
                 - 步骤描述要具体、可操作
                 - **如果有相关经验文档，请参考其中的方法和步骤制定计划**
+                - 查询监控告警时，优先使用 Monitor MCP 的 list_active_alerts 工具
+                - 查询 CPU、内存趋势时，分别使用 query_cpu_metrics、query_memory_metrics 工具
+                - 不要自行编写 PromQL；PromQL 由 Monitor MCP 内部管理
+                - 先通过告警确定受影响服务，再使用同一 service_name 查询对应指标
 
                 示例输入："分析当前系统的性能问题"
                 示例输出（假设有对应工具）：
-                步骤1: 使用 get_metrics 工具收集系统的 CPU 和内存使用情况
-                步骤2: 使用 query_logs 工具检查最近的错误日志
-                步骤3: 使用 query_database 工具分析慢查询日志
-                步骤4: 综合以上信息生成性能分析报告
+                步骤1: 使用 list_active_alerts 查询当前活动告警并确定受影响服务
+                步骤2: 使用 query_cpu_metrics 和 query_memory_metrics 查询该服务的资源趋势
+                步骤3: 使用日志工具检查告警时间窗口内的错误日志
+                步骤4: 综合告警、指标、日志和经验文档生成性能分析报告
             """).strip(),
         ),
         ("placeholder", "{messages}"),
@@ -152,8 +156,8 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
         # 返回一个默认计划
         return {
             "plan": [
-                "收集相关信息",
-                "分析数据",
-                "生成报告"
+                "使用 list_active_alerts 查询当前活动告警并确定受影响服务",
+                "使用 query_cpu_metrics 和 query_memory_metrics 查询受影响服务的资源趋势",
+                "结合日志、指标和经验文档分析根因并生成报告",
             ]
         }

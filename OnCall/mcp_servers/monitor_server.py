@@ -1,125 +1,497 @@
-"""智能运维监控 MCP Server
+"""智能运维监控 MCP Server。
 
-本地实现的监控服务 MCP Server，提供：
-- 监控数据查询（CPU、内存、磁盘、网络等）
-- 进程信息查询
-- 历史工单查询
-- 服务信息查询
-
-用于支持运维 Agent 的故障排查场景。
+Monitor MCP 作为 Agent 与监控平台之间的适配层，对外提供稳定的业务工具，
+内部通过 Prometheus HTTP API 查询活动告警和时序指标。
 """
 
-import logging
+from __future__ import annotations
+
 import functools
 import json
-import random
-from typing import Dict, Any, Optional
-from datetime import datetime, timedelta
+import logging
+import math
+import os
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+import httpx
+from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-# 配置日志
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("Monitor_MCP_Server")
 
 mcp = FastMCP("Monitor")
 
+PROMETHEUS_BASE_URL = os.getenv(
+    "PROMETHEUS_BASE_URL", "http://127.0.0.1:9090"
+).rstrip("/")
+PROMETHEUS_REQUEST_TIMEOUT = float(os.getenv("PROMETHEUS_REQUEST_TIMEOUT", "10"))
+MONITOR_EXPORTER_TYPE = os.getenv("MONITOR_EXPORTER_TYPE", "windows").strip().lower()
+PROMETHEUS_SERVICE_LABEL = os.getenv("PROMETHEUS_SERVICE_LABEL", "service").strip()
+
+QUERY_API_PATH = "/api/v1/query"
+QUERY_RANGE_API_PATH = "/api/v1/query_range"
+ALERTS_API_PATH = "/api/v1/alerts"
+
+CPU_ALERT_THRESHOLD = 80.0
+MEMORY_ALERT_THRESHOLD = 70.0
+
+
+class PrometheusError(RuntimeError):
+    """Prometheus 请求或响应错误。"""
+
 
 def log_tool_call(func):
-    """装饰器：记录工具调用的日志，包括方法名、参数和返回状态"""
+    """记录工具调用参数、状态和结果摘要。"""
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         method_name = func.__name__
+        logger.info("=" * 80)
+        logger.info("调用方法: %s", method_name)
 
-        # 记录调用信息
-        logger.info(f"=" * 80)
-        logger.info(f"调用方法: {method_name}")
+        try:
+            params_str = json.dumps(kwargs, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            params_str = str(kwargs)
+        logger.info("参数信息:\n%s", params_str if kwargs else "无")
 
-        # 记录参数（排除self等）
-        if kwargs:
-            # 使用 json.dumps 格式化参数，处理可能的序列化错误
-            try:
-                params_str = json.dumps(kwargs, ensure_ascii=False, indent=2)
-            except (TypeError, ValueError):
-                params_str = str(kwargs)
-            logger.info(f"参数信息:\n{params_str}")
-        else:
-            logger.info("参数信息: 无")
-
-        # 执行方法
         try:
             result = func(*args, **kwargs)
-
-            # 记录返回状态
-            logger.info(f"返回状态: SUCCESS")
-
-            # 记录返回结果摘要（避免日志过长）
+            logger.info("返回状态: %s", "SUCCESS" if result.get("success", True) else "FAILED")
             if isinstance(result, dict):
-                summary = {k: v if not isinstance(v, (list, dict)) else f"<{type(v).__name__} with {len(v)} items>"
-                          for k, v in list(result.items())[:5]}
-                logger.info(f"返回结果摘要: {json.dumps(summary, ensure_ascii=False)}")
-            else:
-                logger.info(f"返回结果: {result}")
-
-            logger.info(f"=" * 80)
+                summary = {
+                    key: value
+                    if not isinstance(value, (list, dict))
+                    else f"<{type(value).__name__} with {len(value)} items>"
+                    for key, value in list(result.items())[:6]
+                }
+                logger.info("返回结果摘要: %s", json.dumps(summary, ensure_ascii=False))
+            logger.info("=" * 80)
             return result
-
-        except Exception as e:
-            # 记录错误状态
-            logger.error(f"返回状态: ERROR")
-            logger.error(f"错误信息: {str(e)}")
-            logger.error(f"=" * 80)
+        except Exception as exc:
+            logger.exception("工具执行异常: %s", exc)
+            logger.info("=" * 80)
             raise
 
     return wrapper
 
 
-# ============================================================
-# 辅助函数
-# ============================================================
+def _validate_configuration() -> None:
+    if MONITOR_EXPORTER_TYPE not in {"windows", "node", "auto"}:
+        raise ValueError(
+            "MONITOR_EXPORTER_TYPE 必须是 windows、node 或 auto，"
+            f"当前值为 {MONITOR_EXPORTER_TYPE!r}"
+        )
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", PROMETHEUS_SERVICE_LABEL):
+        raise ValueError(
+            "PROMETHEUS_SERVICE_LABEL 不是合法的 Prometheus 标签名: "
+            f"{PROMETHEUS_SERVICE_LABEL!r}"
+        )
+
+
+def _local_timezone():
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
 
 def parse_time_or_default(time_str: Optional[str], default_offset_hours: int = 0) -> datetime:
-    """解析时间字符串或返回默认时间。
+    """解析本地时间或 RFC3339 时间；未提供时使用当前时间偏移。"""
+    if not time_str:
+        return datetime.now().astimezone() + timedelta(hours=default_offset_hours)
 
-    Args:
-        time_str: 时间字符串（格式：YYYY-MM-DD HH:MM:SS）
-        default_offset_hours: 默认时间偏移（小时）
-
-    Returns:
-        datetime: 解析后的时间对象
-    """
-    if time_str:
+    value = time_str.strip()
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
         try:
-            return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            pass
-    # 返回默认时间（当前时间 + 偏移）
-    return datetime.now() + timedelta(hours=default_offset_hours)
+            parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError as exc:
+            raise ValueError(
+                "时间格式必须是 YYYY-MM-DD HH:MM:SS 或 RFC3339"
+            ) from exc
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_local_timezone())
+    return parsed
 
 
-def generate_time_series(base_time: datetime, minutes_offset: int, format_str: str = "%Y-%m-%d %H:%M:%S") -> str:
-    """生成时间序列字符串。
+def _validate_interval(interval: str) -> str:
+    value = interval.strip().lower()
+    if len(value) < 2 or value[-1] not in {"s", "m", "h"}:
+        raise ValueError("interval 必须使用秒、分钟或小时格式，例如 30s、1m、5m、1h")
+    try:
+        amount = int(value[:-1])
+    except ValueError as exc:
+        raise ValueError("interval 数值部分必须是正整数") from exc
+    if amount <= 0:
+        raise ValueError("interval 必须大于 0")
+    return value
 
-    Args:
-        base_time: 基准时间
-        minutes_offset: 分钟偏移量
-        format_str: 时间格式字符串
 
-    Returns:
-        str: 格式化的时间字符串
+def _escape_label_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _service_matcher(service_name: str) -> str:
+    return f'{PROMETHEUS_SERVICE_LABEL}="{_escape_label_value(service_name)}"'
+
+
+def _prometheus_get(path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    url = f"{PROMETHEUS_BASE_URL}{path}"
+    logger.info("请求 Prometheus: %s params=%s", url, params or {})
+
+    try:
+        with httpx.Client(
+            timeout=PROMETHEUS_REQUEST_TIMEOUT,
+            trust_env=False,
+        ) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            body = response.json()
+    except httpx.TimeoutException as exc:
+        raise PrometheusError(f"Prometheus 请求超时: {url}") from exc
+    except httpx.HTTPStatusError as exc:
+        raise PrometheusError(
+            f"Prometheus 返回 HTTP {exc.response.status_code}: {exc.response.text[:300]}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise PrometheusError(f"无法连接 Prometheus: {exc}") from exc
+    except ValueError as exc:
+        raise PrometheusError("Prometheus 返回的内容不是合法 JSON") from exc
+
+    if body.get("status") != "success":
+        error_type = body.get("errorType", "unknown")
+        error = body.get("error", "Prometheus returned non-success status")
+        raise PrometheusError(f"Prometheus 查询失败 ({error_type}): {error}")
+
+    return body
+
+
+def _cpu_query(service_name: str, exporter_type: str) -> str:
+    matcher = _service_matcher(service_name)
+    if exporter_type == "node":
+        return (
+            "100 - (avg by (instance, job, service, system, station) "
+            f"(rate(node_cpu_seconds_total{{{matcher},mode=\"idle\"}}[5m])) * 100)"
+        )
+    if exporter_type == "windows":
+        return (
+            "100 - (avg by (instance, job, service, system, station) "
+            f"(rate(windows_cpu_time_total{{{matcher},mode=\"idle\"}}[5m])) * 100)"
+        )
+    return f"({_cpu_query(service_name, 'windows')}) or ({_cpu_query(service_name, 'node')})"
+
+
+def _memory_query(service_name: str, exporter_type: str) -> str:
+    matcher = _service_matcher(service_name)
+    if exporter_type == "node":
+        return (
+            "(1 - ("
+            f"node_memory_MemAvailable_bytes{{{matcher}}} / "
+            f"node_memory_MemTotal_bytes{{{matcher}}}"
+            ")) * 100"
+        )
+    if exporter_type == "windows":
+        return (
+            "(1 - ("
+            f"windows_os_physical_memory_free_bytes{{{matcher}}} / "
+            f"windows_cs_physical_memory_bytes{{{matcher}}}"
+            ")) * 100"
+        )
+    return f"({_memory_query(service_name, 'windows')}) or ({_memory_query(service_name, 'node')})"
+
+
+def _parse_matrix(data: dict[str, Any]) -> list[dict[str, Any]]:
+    if data.get("resultType") != "matrix":
+        raise PrometheusError(
+            f"期望 Prometheus 返回 matrix，实际为 {data.get('resultType')!r}"
+        )
+
+    series: list[dict[str, Any]] = []
+    for item in data.get("result", []):
+        if not isinstance(item, dict):
+            continue
+        points: list[dict[str, Any]] = []
+        for raw_point in item.get("values", []):
+            if not isinstance(raw_point, list) or len(raw_point) != 2:
+                continue
+            try:
+                timestamp = float(raw_point[0])
+                value = float(raw_point[1])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            points.append(
+                {
+                    "timestamp": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(),
+                    "value": round(value, 2),
+                }
+            )
+        series.append({"labels": item.get("metric", {}), "data_points": points})
+    return series
+
+
+def _statistics(series: list[dict[str, Any]]) -> dict[str, Any]:
+    values = [
+        point["value"]
+        for item in series
+        for point in item.get("data_points", [])
+        if isinstance(point.get("value"), (int, float))
+    ]
+    if not values:
+        return {}
+
+    sorted_values = sorted(values)
+    p95_index = min(len(sorted_values) - 1, int((len(sorted_values) - 1) * 0.95))
+    latest_values = [
+        item["data_points"][-1]["value"]
+        for item in series
+        if item.get("data_points")
+    ]
+    current = sum(latest_values) / len(latest_values) if latest_values else values[-1]
+
+    return {
+        "current": round(current, 2),
+        "avg": round(sum(values) / len(values), 2),
+        "max": round(max(values), 2),
+        "min": round(min(values), 2),
+        "p95": round(sorted_values[p95_index], 2),
+        "sample_count": len(values),
+    }
+
+
+def _metric_error(
+    service_name: str,
+    metric_name: str,
+    message: str,
+    error_type: str,
+) -> dict[str, Any]:
+    return {
+        "success": False,
+        "source": "prometheus",
+        "service_name": service_name,
+        "metric_name": metric_name,
+        "error_type": error_type,
+        "message": message,
+    }
+
+
+def _query_metric(
+    service_name: str,
+    metric_name: str,
+    query_builder,
+    threshold: float,
+    start_time: Optional[str],
+    end_time: Optional[str],
+    interval: str,
+) -> dict[str, Any]:
+    try:
+        start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
+        end_dt = parse_time_or_default(end_time)
+        step = _validate_interval(interval)
+        if start_dt >= end_dt:
+            raise ValueError("start_time 必须早于 end_time")
+
+        promql = query_builder(service_name, MONITOR_EXPORTER_TYPE)
+        body = _prometheus_get(
+            QUERY_RANGE_API_PATH,
+            {
+                "query": promql,
+                "start": start_dt.timestamp(),
+                "end": end_dt.timestamp(),
+                "step": step,
+            },
+        )
+        series = _parse_matrix(body.get("data", {}))
+        stats = _statistics(series)
+
+        if not stats:
+            return {
+                "success": True,
+                "source": "prometheus",
+                "service_name": service_name,
+                "metric_name": metric_name,
+                "exporter_type": MONITOR_EXPORTER_TYPE,
+                "interval": step,
+                "time_range": {
+                    "start": start_dt.isoformat(),
+                    "end": end_dt.isoformat(),
+                },
+                "data_points": [],
+                "series": series,
+                "statistics": {},
+                "alert_info": {
+                    "triggered": False,
+                    "threshold": threshold,
+                    "message": "Prometheus 查询成功，但没有匹配的时序数据",
+                },
+                "query_metadata": {
+                    "service_label": PROMETHEUS_SERVICE_LABEL,
+                    "promql": promql,
+                },
+                "message": (
+                    f"未找到服务 {service_name!r} 的 {metric_name} 数据，请检查服务标签、"
+                    "Exporter 抓取状态和时间范围"
+                ),
+            }
+
+        triggered = stats["max"] > threshold
+        return {
+            "success": True,
+            "source": "prometheus",
+            "service_name": service_name,
+            "metric_name": metric_name,
+            "exporter_type": MONITOR_EXPORTER_TYPE,
+            "interval": step,
+            "time_range": {
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+            },
+            # 保留旧工具的 data_points 字段，默认呈现第一条目标序列。
+            "data_points": series[0]["data_points"] if series else [],
+            "series": series,
+            "statistics": stats,
+            "alert_info": {
+                "triggered": triggered,
+                "threshold": threshold,
+                "message": (
+                    f"{metric_name} 最大值 {stats['max']}% 超过 {threshold}% 阈值"
+                    if triggered
+                    else f"{metric_name} 未超过 {threshold}% 阈值"
+                ),
+            },
+            "query_metadata": {
+                "service_label": PROMETHEUS_SERVICE_LABEL,
+                "promql": promql,
+            },
+            "message": f"已从 Prometheus 获取 {len(series)} 条目标序列",
+        }
+    except ValueError as exc:
+        return _metric_error(service_name, metric_name, str(exc), "invalid_argument")
+    except PrometheusError as exc:
+        return _metric_error(service_name, metric_name, str(exc), "prometheus_error")
+
+
+def _parse_active_at(active_at: str) -> Optional[datetime]:
+    if not active_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(active_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _duration(active_at: str) -> str:
+    parsed = _parse_active_at(active_at)
+    if parsed is None:
+        return "unknown"
+    seconds = max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes}m{seconds}s"
+    if minutes:
+        return f"{minutes}m{seconds}s"
+    return f"{seconds}s"
+
+
+@mcp.tool()
+@log_tool_call
+def list_active_alerts(
+    severity: Optional[str] = None,
+    service_name: Optional[str] = None,
+    instance: Optional[str] = None,
+    alert_name: Optional[str] = None,
+    state: Optional[str] = None,
+) -> dict[str, Any]:
+    """查询 Prometheus 当前活动告警。
+
+    当任务需要判断系统当前是否存在 firing/pending 告警，或需要确定后续指标查询目标时，
+    应优先调用本工具。过滤参数均为可选，不传参数时返回全部活动告警。
     """
-    result_time = base_time + timedelta(minutes=minutes_offset)
-    return result_time.strftime(format_str)
+    try:
+        body = _prometheus_get(ALERTS_API_PATH)
+        raw_alerts = (body.get("data") or {}).get("alerts") or []
+        alerts: list[dict[str, Any]] = []
+        state_counts: dict[str, int] = {}
 
+        for raw_alert in raw_alerts:
+            if not isinstance(raw_alert, dict):
+                continue
+            labels = raw_alert.get("labels") or {}
+            annotations = raw_alert.get("annotations") or {}
+            alert_state = str(raw_alert.get("state", ""))
 
+            if severity and labels.get("severity") != severity:
+                continue
+            if service_name and labels.get(PROMETHEUS_SERVICE_LABEL) != service_name:
+                continue
+            if instance and labels.get("instance") != instance:
+                continue
+            if alert_name and labels.get("alertname") != alert_name:
+                continue
+            if state and alert_state != state:
+                continue
 
+            active_at = str(raw_alert.get("activeAt", ""))
+            state_counts[alert_state] = state_counts.get(alert_state, 0) + 1
+            alerts.append(
+                {
+                    "alert_name": labels.get("alertname", ""),
+                    "state": alert_state,
+                    "severity": labels.get("severity", ""),
+                    "service_name": labels.get(PROMETHEUS_SERVICE_LABEL, ""),
+                    "instance": labels.get("instance", ""),
+                    "job": labels.get("job", ""),
+                    "active_at": active_at,
+                    "duration": _duration(active_at),
+                    "summary": annotations.get("summary", ""),
+                    "description": annotations.get("description", ""),
+                    "labels": labels,
+                }
+            )
 
+        alerts.sort(
+            key=lambda item: _parse_active_at(item["active_at"])
+            or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        return {
+            "success": True,
+            "source": "prometheus",
+            "alerts": alerts,
+            "state_counts": state_counts,
+            "total": len(alerts),
+            "filters": {
+                "severity": severity,
+                "service_name": service_name,
+                "instance": instance,
+                "alert_name": alert_name,
+                "state": state,
+            },
+            "message": f"已从 Prometheus 获取 {len(alerts)} 条活动告警",
+        }
+    except PrometheusError as exc:
+        return {
+            "success": False,
+            "source": "prometheus",
+            "error_type": "prometheus_error",
+            "message": str(exc),
+            "alerts": [],
+            "total": 0,
+        }
 
-# ============================================================
-# 监控数据查询工具
-# ============================================================
 
 @mcp.tool()
 @log_tool_call
@@ -127,151 +499,22 @@ def query_cpu_metrics(
     service_name: str,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
-    interval: str = "1m"
-) -> Dict[str, Any]:
-    """查询服务的 CPU 使用率监控数据。
+    interval: str = "1m",
+) -> dict[str, Any]:
+    """查询指定服务最近一段时间的 CPU 使用率。
 
-    Args:
-        service_name: 服务名称（必填）
-            示例: "data-sync-service"
-        
-        start_time: 开始时间（可选，字符串类型）
-            格式: "YYYY-MM-DD HH:MM:SS"
-            示例: "2026-02-14 10:00:00"
-            默认值: 如果不传，默认为当前时间的1小时前
-            注意: 必须使用字符串格式，而非时间戳
-        
-        end_time: 结束时间（可选，字符串类型）
-            格式: "YYYY-MM-DD HH:MM:SS"
-            示例: "2026-02-14 11:00:00"
-            默认值: 如果不传，默认为当前时间
-            注意: 必须使用字符串格式，而非时间戳
-        
-        interval: 数据聚合间隔（可选）
-            可选值: "1m" (1分钟), "5m" (5分钟), "1h" (1小时)
-            默认值: "1m"
-            说明: 控制数据点的时间间隔
-
-    Returns:
-        Dict: CPU 监控数据
-            - service_name: 服务名称
-            - metric_name: 指标名称 (cpu_usage_percent)
-            - interval: 数据聚合间隔
-            - data_points: 数据点列表，每个点包含:
-                * timestamp: 时间点（格式: HH:MM）
-                * value: CPU 使用率百分比
-            - statistics: 统计信息
-                * average: 平均值
-                * max: 最大值
-                * min: 最小值
-            - alert: 告警信息（如有）
-                * triggered: 是否触发告警
-                * threshold: 告警阈值
-                * message: 告警消息
-    
-    使用示例:
-        # 示例1: 使用默认时间（最近1小时）
-        query_cpu_metrics(service_name="data-sync-service")
-        
-        # 示例2: 指定时间范围
-        query_cpu_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00",
-            end_time="2026-02-14 11:00:00",
-            interval="5m"
-        )
-        
-        # 示例3: 只指定开始时间（结束时间自动为当前时间）
-        query_cpu_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00"
-        )
+    当告警、日志或用户描述涉及高负载、响应缓慢、任务积压时调用。service_name 应对应
+    Prometheus 中配置的 service 标签；默认查询最近一小时，可指定本地时间或 RFC3339 时间。
     """
-    # 解析时间参数
-    start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
-    end_dt = parse_time_or_default(end_time, default_offset_hours=0)
-    
-    # 解析间隔时间（interval: 1m, 5m, 1h 等）
-    interval_minutes = 1  # 默认 1 分钟
-    if interval.endswith('m'):
-        interval_minutes = int(interval[:-1])
-    elif interval.endswith('h'):
-        interval_minutes = int(interval[:-1]) * 60
-
-    # 动态生成 CPU 使用率数据：从低到高逐渐增长
-    data_points = []
-    current_time = start_dt
-    time_index = 0
-
-    # 初始 CPU 使用率（10%）
-    base_cpu = 10.0
-
-    while current_time <= end_dt:
-        # CPU 使用率逐渐升高的算法：
-        # - 前几个数据点保持在 10% 左右
-        # - 然后开始快速上升
-        # - 最终达到 95% 左右
-
-        if time_index < 3:
-            # 初始阶段：10% 左右波动
-            cpu_value = base_cpu + (time_index * 0.5)
-        else:
-            # 上升阶段：使用指数增长模型
-            growth_factor = (time_index - 2) * 8.5
-            cpu_value = min(base_cpu + growth_factor, 96.0)
-
-        # 添加一些随机波动（±2%）
-        cpu_value = round(cpu_value + random.uniform(-2, 2), 1)
-        cpu_value = max(0, min(100, cpu_value))  # 确保在 0-100 范围内
-
-        data_point = {
-            "timestamp": current_time.strftime("%H:%M"),
-            "value": cpu_value,
-            "process_id": "pid-12345"
-        }
-
-        data_points.append(data_point)
-
-        # 下一个时间点
-        current_time += timedelta(minutes=interval_minutes)
-        time_index += 1
-
-    # 计算统计信息
-    if data_points:
-        values = [d["value"] for d in data_points]
-        avg_value = round(sum(values) / len(values), 2)
-        max_value = max(values)
-        min_value = min(values)
-
-        # 检测是否有 CPU 突增（超过 80%）
-        spike_detected = max_value > 80.0
-
-        return {
-            "service_name": service_name,
-            "metric_name": "cpu_usage_percent",
-            "interval": interval,
-            "data_points": data_points,
-            "statistics": {
-                "avg": avg_value,
-                "max": max_value,
-                "min": min_value,
-                "p95": round(sorted(values)[int(len(values) * 0.95)] if len(values) > 1 else max_value, 2),
-                "spike_detected": spike_detected
-            },
-            "alert_info": {
-                "triggered": spike_detected,
-                "threshold": 80.0,
-                "message": "CPU 使用率持续超过 80% 阈值" if spike_detected else "CPU 使用率正常"
-            }
-        }
-    else:
-        return {
-            "service_name": service_name,
-            "metric_name": "cpu_usage_percent",
-            "interval": interval,
-            "data_points": [],
-            "statistics": {},
-        }
+    return _query_metric(
+        service_name=service_name,
+        metric_name="cpu_usage_percent",
+        query_builder=_cpu_query,
+        threshold=CPU_ALERT_THRESHOLD,
+        start_time=start_time,
+        end_time=end_time,
+        interval=interval,
+    )
 
 
 @mcp.tool()
@@ -280,156 +523,32 @@ def query_memory_metrics(
     service_name: str,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
-    interval: str = "1m"
-) -> Dict[str, Any]:
-    """查询服务的内存使用监控数据。
+    interval: str = "1m",
+) -> dict[str, Any]:
+    """查询指定服务最近一段时间的内存使用率。
 
-    Args:
-        service_name: 服务名称（必填）
-            示例: "data-sync-service"
-        
-        start_time: 开始时间（可选，字符串类型）
-            格式: "YYYY-MM-DD HH:MM:SS"
-            示例: "2026-02-14 10:00:00"
-            默认值: 如果不传，默认为当前时间的1小时前
-            注意: 必须使用字符串格式，而非时间戳
-        
-        end_time: 结束时间（可选，字符串类型）
-            格式: "YYYY-MM-DD HH:MM:SS"
-            示例: "2026-02-14 11:00:00"
-            默认值: 如果不传，默认为当前时间
-            注意: 必须使用字符串格式，而非时间戳
-        
-        interval: 数据聚合间隔（可选）
-            可选值: "1m" (1分钟), "5m" (5分钟), "1h" (1小时)
-            默认值: "1m"
-
-    Returns:
-        Dict: 内存监控数据
-            - service_name: 服务名称
-            - metric_name: 指标名称 (memory_usage_percent)
-            - interval: 数据聚合间隔
-            - data_points: 数据点列表，每个点包含:
-                * timestamp: 时间点（格式: HH:MM）
-                * value: 内存使用率百分比
-                * used_gb: 已使用内存（GB）
-                * total_gb: 总内存（GB）
-            - statistics: 统计信息
-                * average: 平均值
-                * max: 最大值
-                * min: 最小值
-            - alert: 告警信息（如有）
-                * triggered: 是否触发告警
-                * threshold: 告警阈值
-                * message: 告警消息
-    
-    使用示例:
-        # 示例1: 使用默认时间（最近1小时）
-        query_memory_metrics(service_name="data-sync-service")
-        
-        # 示例2: 指定时间范围
-        query_memory_metrics(
-            service_name="data-sync-service",
-            start_time="2026-02-14 10:00:00",
-            end_time="2026-02-14 11:00:00",
-            interval="5m"
-        )
+    当告警、日志或用户描述涉及内存压力、OOM、进程被终止或持续资源增长时调用。
+    service_name 应对应 Prometheus 中配置的 service 标签；默认查询最近一小时。
     """
-    # 解析时间参数
-    start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
-    end_dt = parse_time_or_default(end_time, default_offset_hours=0)
-    
-    # 解析间隔时间（interval: 1m, 5m, 1h 等）
-    interval_minutes = 1  # 默认 1 分钟
-    if interval.endswith('m'):
-        interval_minutes = int(interval[:-1])
-    elif interval.endswith('h'):
-        interval_minutes = int(interval[:-1]) * 60
-    
-    # 动态生成内存使用率数据：从低到高逐渐增长
-    data_points = []
-    current_time = start_dt
-    time_index = 0
-    
-    # 初始内存使用率（30%）
-    base_memory = 30.0
-    total_gb = 8.0  # 总内存 8GB
-    
-    while current_time <= end_dt:
-        # 内存使用率逐渐升高的算法：
-        # - 前几个数据点保持在 30% 左右
-        # - 然后开始逐步上升
-        # - 最终达到 85% 左右
-        
-        if time_index < 3:
-            # 初始阶段：30% 左右波动
-            memory_value = base_memory + (time_index * 1.0)
-        else:
-            # 上升阶段：使用线性增长模型（内存增长比 CPU 慢）
-            growth_factor = (time_index - 2) * 5.5
-            memory_value = min(base_memory + growth_factor, 85.0)
-        
-        # 添加一些随机波动（±1%）
-        memory_value = round(memory_value + random.uniform(-1, 1), 1)
-        memory_value = max(0, min(100, memory_value))  # 确保在 0-100 范围内
-        
-        # 计算已使用内存（GB）
-        used_gb = round((memory_value / 100.0) * total_gb, 2)
-        
-        data_point = {
-            "timestamp": current_time.strftime("%H:%M"),
-            "value": memory_value,
-            "used_gb": used_gb,
-            "total_gb": total_gb
-        }
-        
-        data_points.append(data_point)
-        
-        # 下一个时间点
-        current_time += timedelta(minutes=interval_minutes)
-        time_index += 1
-    
-    # 计算统计信息
-    if data_points:
-        values = [d["value"] for d in data_points]
-        avg_value = round(sum(values) / len(values), 2)
-        max_value = max(values)
-        min_value = min(values)
-        
-        # 检测是否有内存压力（超过 70%）
-        memory_pressure = max_value > 70.0
-        
-        return {
-            "service_name": service_name,
-            "metric_name": "memory_usage_percent",
-            "interval": interval,
-            "data_points": data_points,
-            "statistics": {
-                "avg": avg_value,
-                "max": max_value,
-                "min": min_value,
-                "p95": round(sorted(values)[int(len(values) * 0.95)] if len(values) > 1 else max_value, 2),
-                "memory_pressure": memory_pressure
-            },
-            "alert_info": {
-                "triggered": memory_pressure,
-                "threshold": 70.0,
-                "message": "内存使用率超过 70% 阈值，存在内存压力" if memory_pressure else "内存使用率正常"
-            }
-        }
-    else:
-        return {
-            "service_name": service_name,
-            "metric_name": "memory_usage_percent",
-            "interval": interval,
-            "data_points": [],
-            "statistics": {},
-            "error": "时间范围无效或没有生成数据点"
-        }
+    return _query_metric(
+        service_name=service_name,
+        metric_name="memory_usage_percent",
+        query_builder=_memory_query,
+        threshold=MEMORY_ALERT_THRESHOLD,
+        start_time=start_time,
+        end_time=end_time,
+        interval=interval,
+    )
 
 
+_validate_configuration()
+logger.info(
+    "Monitor MCP configured: prometheus=%s exporter=%s service_label=%s",
+    PROMETHEUS_BASE_URL,
+    MONITOR_EXPORTER_TYPE,
+    PROMETHEUS_SERVICE_LABEL,
+)
 
 
 if __name__ == "__main__":
-    # 使用 streamable-http 模式，运行在 8004 端口
     mcp.run(transport="streamable-http", host="127.0.0.1", port=8004, path="/mcp")

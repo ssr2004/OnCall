@@ -1,134 +1,189 @@
 # MCP Servers
 
-为 AIOps 智能诊断提供日志查询和监控数据工具。
+为对话 Agent 和 AIOps 诊断 Agent 提供日志与监控工具。主应用通过
+`MultiServerMCPClient` 动态发现工具，Agent 不直接依赖具体监控平台 API。
 
-## 📚 服务列表
+## 服务列表
 
 ### CLS Server (`cls_server.py`)
-**日志查询服务** - 端口 8003
 
-**核心工具：**
-- `get_current_timestamp` - 获取当前时间戳
-- `get_topic_info_by_name` - 查询日志主题
-- `search_log` - 日志搜索
-- `search_service_logs` - 服务日志查询（支持级别筛选）
-- `analyze_log_pattern` - 日志模式分析
+日志查询服务，默认监听 `http://127.0.0.1:8003/mcp`。
+
+当前工具：
+
+- `get_current_timestamp`
+- `get_region_code_by_name`
+- `get_topic_info_by_name`
+- `search_topic_by_service_name`
+- `search_log`
+
+CLS Server 当前仍使用演示数据，后续可在服务内部替换为真实日志平台适配器。
 
 ### Monitor Server (`monitor_server.py`)
-**监控数据服务** - 端口 8004
 
-**核心工具：**
-- `query_cpu_metrics` - CPU 使用率查询
-- `query_memory_metrics` - 内存使用查询
-- `query_process_list` - 进程列表
-- `search_historical_tickets` - 历史工单查询
-- `get_service_info` / `list_all_services` - 服务信息
+Prometheus 监控适配服务，默认监听 `http://127.0.0.1:8004/mcp`。
 
-## 🚀 快速开始
+当前工具：
 
-### 安装依赖
+- `list_active_alerts`：查询 Prometheus 当前 firing/pending 告警
+- `query_cpu_metrics`：查询指定服务的 CPU 使用率时间序列
+- `query_memory_metrics`：查询指定服务的内存使用率时间序列
+
+Monitor MCP 内部调用以下 Prometheus HTTP API：
+
+- `GET /api/v1/alerts`
+- `GET /api/v1/query_range`
+
+Agent 只需要使用业务工具，不需要生成 PromQL，也不需要知道 Prometheus 地址、
+Exporter 指标名和认证配置。
+
+## Prometheus 配置
+
+项目通过 `vector-database.yml` 启动 Prometheus，默认地址为：
+
+```text
+http://127.0.0.1:9090
+```
+
+配置文件：
+
+```text
+monitoring/prometheus.yml
+monitoring/alert-rules.yml
+```
+
+本地 Windows 演示环境默认抓取：
+
+```text
+host.docker.internal:9182
+```
+
+因此需要在 Windows 主机安装并启动 `windows_exporter`，监听 9182 端口。项目为该目标
+添加以下静态标签：
+
+```text
+system=oncall-demo
+service=data-sync-service
+station=local-demo
+```
+
+Monitor MCP 默认使用 `service` 标签定位查询目标。
+
+## 环境变量
+
+Monitor MCP 会读取项目根目录的 `.env`：
+
+```dotenv
+PROMETHEUS_BASE_URL=http://127.0.0.1:9090
+PROMETHEUS_REQUEST_TIMEOUT=10
+MONITOR_EXPORTER_TYPE=windows
+PROMETHEUS_SERVICE_LABEL=service
+```
+
+`MONITOR_EXPORTER_TYPE` 支持：
+
+- `windows`：使用 windows_exporter 指标
+- `node`：使用 node_exporter 指标
+- `auto`：同时尝试 Windows 和 Node Exporter 查询表达式
+
+生产环境如果使用不同的服务标签，例如 `app`，可设置：
+
+```dotenv
+PROMETHEUS_SERVICE_LABEL=app
+```
+
+## 启动方式
+
+### Docker 基础设施
+
 ```bash
-pip install fastmcp
+docker compose -f vector-database.yml up -d
 ```
 
-### 启动服务
+启动后检查：
 
-**方式一：使用 Makefile（推荐）**
+```text
+Prometheus: http://localhost:9090
+Prometheus Targets: http://localhost:9090/targets
+Prometheus Alerts: http://localhost:9090/alerts
+```
+
+### MCP 服务
+
+Linux/macOS：
+
 ```bash
-make mcp-start   # 启动所有 MCP 服务
-make mcp-stop    # 停止所有 MCP 服务
-make mcp-status  # 查看服务状态
+make start-cls
+make start-monitor
+make status-mcp
 ```
 
-**方式二：手动启动**
-```bash
-python mcp_servers/cls_server.py
-python mcp_servers/monitor_server.py
+Windows：
+
+```bat
+.venv\Scripts\python.exe mcp_servers\cls_server.py
+.venv\Scripts\python.exe mcp_servers\monitor_server.py
 ```
 
-## 💡 使用示例
+也可以使用项目的 `start-windows.bat` 启动整套服务。
 
-### AIOps 诊断场景
+## 工具示例
 
-```
-用户: data-sync-service 出现告警，请排查
+查询活动告警：
 
-Agent 自动执行:
-1. list_all_services() → 查看所有服务状态
-2. get_service_info("data-sync-service") → 获取服务详情
-3. query_cpu_metrics("data-sync-service") → CPU 趋势分析
-4. search_service_logs("data-sync-service", level="error") → 错误日志
-5. analyze_log_pattern("data-sync-service") → 日志模式分析
-6. search_historical_tickets(service_name="data-sync-service") → 历史工单
-7. 综合分析 → 生成诊断报告和修复建议
+```python
+list_active_alerts(
+    severity="warning",
+    service_name="data-sync-service",
+)
 ```
 
-### 工具参数示例
+查询最近一小时 CPU：
 
-**查询 CPU 指标：**
 ```python
 query_cpu_metrics(
     service_name="data-sync-service",
-    start_time="2024-02-14 02:00:00",
-    interval="1m"
+    interval="1m",
 )
 ```
 
-**搜索错误日志：**
+查询指定时间范围的内存：
+
 ```python
-search_service_logs(
+query_memory_metrics(
     service_name="data-sync-service",
-    log_level="error",
-    keyword="timeout",
-    limit=100
+    start_time="2026-07-26 10:00:00",
+    end_time="2026-07-26 11:00:00",
+    interval="5m",
 )
 ```
 
-**搜索历史工单：**
-```python
-search_historical_tickets(
-    service_name="data-sync-service",
-    issue_type="cpu",
-    limit=10
-)
-```
+成功结果会包含：
 
-## 🔧 高级配置
+- `source=prometheus`
+- 查询时间范围
+- 原始目标标签
+- 时间序列
+- 当前值、平均值、最大值、最小值和 P95
+- 阈值判断
+- 实际 PromQL 查询元数据
 
-### 接入真实 API
+Prometheus 不可用时工具返回结构化错误，不会静默切换为随机数据。
 
-当前返回模拟数据。接入真实 API 步骤：
+## 生产环境接入
 
-**腾讯云 CLS：**
-```bash
-# 安装 SDK
-pip install tencentcloud-sdk-python
+如果甲方已有 Prometheus：
 
-# 配置环境变量
-export TENCENTCLOUD_SECRET_ID="your-id"
-export TENCENTCLOUD_SECRET_KEY="your-key"
+1. 将 `PROMETHEUS_BASE_URL` 指向内部 Prometheus。
+2. 根据甲方指标体系设置 `MONITOR_EXPORTER_TYPE`。
+3. 根据标签规范设置 `PROMETHEUS_SERVICE_LABEL`。
+4. 在 Monitor MCP 内维护经过验证的 PromQL，不让 Agent 自行生成查询。
 
-# 在 cls_server.py 中集成
-from tencentcloud.cls.v20201016 import cls_client
-```
+如果甲方使用其他内部监控平台，可以保留 MCP 工具名称和返回结构，只替换 Monitor MCP
+内部适配器，避免修改对话 Agent 和 AIOps 工作流。
 
-**其他监控系统：**
-- Prometheus
-- Grafana
-- 云监控（腾讯云/阿里云/AWS）
-- 自建监控平台
+## 数据边界
 
-### 自定义 Mock 数据
-
-修改各 Server 文件中的数据生成逻辑，模拟实际场景。
-
-## 📚 参考资料
-
-- [FastMCP 文档](https://github.com/jlowin/fastmcp)
-- [MCP 协议](https://modelcontextprotocol.io/)
-- [LangGraph 文档](https://langchain-ai.github.io/langgraph/)
-- [主项目 README](../README.md)
-
----
-
-**注意**: 当前版本返回模拟数据，生产环境需配置真实 API。
+Prometheus 适合采集服务器、应用、中间件和服务运行指标。SCADA、EMS、DMS 等电网
+业务遥测数据应通过甲方授权的只读接口、数据副本或专用适配器接入，不应让 Agent
+直接连接现场控制设备。
