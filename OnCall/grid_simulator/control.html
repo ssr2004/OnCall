@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b2035'/%3E%3Cpath d='M16 6v20M10 11l6-5 6 5M9 16h14M11 22h10' fill='none' stroke='%2339d8ff' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+    <title>电网业务模拟控制台</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #07111f;
+            --panel: rgba(15, 31, 50, 0.88);
+            --panel-strong: #10243a;
+            --line: rgba(139, 180, 213, 0.18);
+            --text: #edf6ff;
+            --muted: #8fa9bf;
+            --cyan: #39d8ff;
+            --blue: #4f8cff;
+            --green: #3ee2a0;
+            --amber: #ffbd59;
+            --red: #ff667a;
+            --shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at 12% 12%, rgba(38, 139, 255, 0.16), transparent 30rem),
+                radial-gradient(circle at 88% 2%, rgba(57, 216, 255, 0.12), transparent 28rem),
+                linear-gradient(145deg, #050c17 0%, var(--bg) 48%, #09192a 100%);
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            opacity: 0.2;
+            background-image:
+                linear-gradient(var(--line) 1px, transparent 1px),
+                linear-gradient(90deg, var(--line) 1px, transparent 1px);
+            background-size: 42px 42px;
+            mask-image: linear-gradient(to bottom, black, transparent 78%);
+        }
+
+        a { color: inherit; }
+
+        .shell {
+            position: relative;
+            width: min(1180px, calc(100% - 32px));
+            margin: 0 auto;
+            padding: 28px 0 48px;
+        }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+            margin-bottom: 34px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+        }
+
+        .brand-mark {
+            display: grid;
+            place-items: center;
+            width: 38px;
+            height: 38px;
+            border: 1px solid rgba(57, 216, 255, 0.55);
+            border-radius: 11px;
+            background: linear-gradient(145deg, rgba(57, 216, 255, 0.22), rgba(79, 140, 255, 0.08));
+            box-shadow: 0 0 28px rgba(57, 216, 255, 0.16);
+        }
+
+        .brand-mark svg { width: 23px; height: 23px; }
+
+        .connection {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .connection-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: var(--amber);
+            box-shadow: 0 0 14px currentColor;
+        }
+
+        .connection.online .connection-dot { background: var(--green); }
+        .connection.offline .connection-dot { background: var(--red); }
+
+        .hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.55fr);
+            gap: 22px;
+            align-items: stretch;
+            margin-bottom: 22px;
+        }
+
+        .hero-copy,
+        .current-card,
+        .panel {
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            background: linear-gradient(150deg, rgba(17, 39, 62, 0.93), rgba(9, 23, 38, 0.9));
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(14px);
+        }
+
+        .hero-copy { padding: 34px; }
+
+        .eyebrow {
+            margin: 0 0 12px;
+            color: var(--cyan);
+            font: 700 12px/1.4 ui-monospace, "Cascadia Code", monospace;
+            letter-spacing: 0.18em;
+        }
+
+        h1 {
+            margin: 0;
+            max-width: 760px;
+            font-size: clamp(30px, 5vw, 52px);
+            line-height: 1.13;
+            letter-spacing: -0.035em;
+        }
+
+        .hero-copy p {
+            margin: 18px 0 0;
+            max-width: 700px;
+            color: var(--muted);
+            font-size: 15px;
+            line-height: 1.8;
+        }
+
+        .quick-links {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 24px;
+        }
+
+        .quick-link {
+            padding: 9px 13px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            color: #cce8ff;
+            text-decoration: none;
+            font-size: 13px;
+            background: rgba(255, 255, 255, 0.035);
+            transition: 160ms ease;
+        }
+
+        .quick-link:hover { border-color: var(--cyan); transform: translateY(-1px); }
+
+        .current-card {
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 28px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .current-card::after {
+            content: "";
+            position: absolute;
+            right: -70px;
+            bottom: -80px;
+            width: 220px;
+            height: 220px;
+            border-radius: 50%;
+            background: var(--scenario-color, var(--green));
+            filter: blur(90px);
+            opacity: 0.16;
+        }
+
+        .label {
+            color: var(--muted);
+            font-size: 12px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+
+        .scenario-name {
+            position: relative;
+            z-index: 1;
+            margin: 14px 0 8px;
+            font-size: 26px;
+            font-weight: 750;
+        }
+
+        .scenario-description {
+            position: relative;
+            z-index: 1;
+            min-height: 48px;
+            color: var(--muted);
+            line-height: 1.65;
+            font-size: 14px;
+        }
+
+        .scenario-state {
+            position: relative;
+            z-index: 1;
+            display: inline-flex;
+            align-items: center;
+            align-self: flex-start;
+            gap: 8px;
+            margin-top: 26px;
+            padding: 8px 11px;
+            border-radius: 999px;
+            color: var(--scenario-color, var(--green));
+            background: color-mix(in srgb, var(--scenario-color, var(--green)) 12%, transparent);
+            border: 1px solid color-mix(in srgb, var(--scenario-color, var(--green)) 34%, transparent);
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .panel { padding: 28px; margin-bottom: 22px; }
+
+        .panel-heading {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 18px;
+            margin-bottom: 20px;
+        }
+
+        h2 { margin: 0; font-size: 20px; }
+
+        .panel-hint { color: var(--muted); font-size: 13px; }
+
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .metric {
+            min-width: 0;
+            padding: 18px;
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            background: rgba(3, 13, 24, 0.42);
+        }
+
+        .metric-name {
+            min-height: 38px;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .metric-value {
+            margin-top: 10px;
+            font: 700 24px/1.2 ui-monospace, "Cascadia Code", monospace;
+            color: #f5fbff;
+            white-space: nowrap;
+        }
+
+        .scenario-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .scenario-button {
+            position: relative;
+            min-height: 148px;
+            padding: 19px;
+            border: 1px solid var(--line);
+            border-radius: 15px;
+            color: var(--text);
+            text-align: left;
+            font: inherit;
+            background: rgba(5, 17, 30, 0.58);
+            cursor: pointer;
+            overflow: hidden;
+            transition: 180ms ease;
+        }
+
+        .scenario-button::before {
+            content: "";
+            position: absolute;
+            inset: 0 auto 0 0;
+            width: 3px;
+            background: var(--button-color);
+            opacity: 0.75;
+        }
+
+        .scenario-button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            border-color: color-mix(in srgb, var(--button-color) 60%, transparent);
+            background: color-mix(in srgb, var(--button-color) 8%, rgba(5, 17, 30, 0.58));
+        }
+
+        .scenario-button.active {
+            border-color: var(--button-color);
+            box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--button-color) 35%, transparent);
+            background: color-mix(in srgb, var(--button-color) 11%, rgba(5, 17, 30, 0.58));
+        }
+
+        .scenario-button:disabled { cursor: wait; opacity: 0.62; }
+
+        .button-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .button-title { font-weight: 750; font-size: 16px; }
+
+        .severity {
+            padding: 4px 7px;
+            border-radius: 6px;
+            color: var(--button-color);
+            background: color-mix(in srgb, var(--button-color) 12%, transparent);
+            font: 700 10px/1 ui-monospace, "Cascadia Code", monospace;
+            letter-spacing: 0.08em;
+        }
+
+        .button-description {
+            margin: 12px 0 0;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.55;
+        }
+
+        .button-alert {
+            margin-top: 13px;
+            color: #bad8ec;
+            font: 11px/1.45 ui-monospace, "Cascadia Code", monospace;
+        }
+
+        .operation-strip {
+            display: grid;
+            grid-template-columns: 1.3fr 1fr;
+            gap: 12px;
+            margin-top: 18px;
+        }
+
+        .operation-box {
+            padding: 16px 18px;
+            border: 1px solid var(--line);
+            border-radius: 13px;
+            background: rgba(3, 13, 24, 0.42);
+        }
+
+        .operation-title { color: var(--muted); font-size: 11px; letter-spacing: 0.1em; }
+        .operation-value { margin-top: 8px; line-height: 1.55; font-size: 13px; }
+        .operation-value.success { color: var(--green); }
+        .operation-value.warning { color: var(--amber); }
+        .operation-value.error { color: var(--red); }
+
+        .footer-note {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.65;
+        }
+
+        .footer-note strong { color: #cce8ff; }
+
+        @media (max-width: 900px) {
+            .hero { grid-template-columns: 1fr; }
+            .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .scenario-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+
+        @media (max-width: 620px) {
+            .shell { width: min(100% - 20px, 1180px); padding-top: 18px; }
+            .topbar { margin-bottom: 20px; }
+            .brand span:last-child { display: none; }
+            .hero-copy, .current-card, .panel { padding: 21px; border-radius: 16px; }
+            .scenario-grid, .operation-strip { grid-template-columns: 1fr; }
+            .metrics { grid-template-columns: 1fr 1fr; }
+            .metric { padding: 14px; }
+            .metric-value { font-size: 20px; }
+        }
+    </style>
+</head>
+<body>
+<main class="shell">
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                    <path d="M12 3v18M6 7l6-4 6 4M5 12h14M7 17h10" stroke="#39d8ff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </div>
+            <span>GRID DATA SYNC · SIMULATOR</span>
+        </div>
+        <div id="connection" class="connection">
+            <span class="connection-dot"></span>
+            <span id="connectionText">正在连接模拟服务</span>
+        </div>
+    </header>
+
+    <section class="hero">
+        <div class="hero-copy">
+            <p class="eyebrow">DEMO CONTROL PLANE / 业务异常注入</p>
+            <h1>电网数据采集与同步<br>模拟控制台</h1>
+            <p>通过预置场景改变模拟服务的业务指标和日志，供 Prometheus 触发告警并由 AIOps 完成诊断。所有操作只影响本地模拟数据，不包含任何真实电网控制能力。</p>
+            <div class="quick-links">
+                <a class="quick-link" href="http://localhost:9090/alerts" target="_blank" rel="noreferrer">Prometheus Alerts ↗</a>
+                <a class="quick-link" href="http://localhost:9090/targets" target="_blank" rel="noreferrer">Prometheus Targets ↗</a>
+                <a class="quick-link" href="http://localhost:9900" target="_blank" rel="noreferrer">打开 AIOps ↗</a>
+            </div>
+        </div>
+        <aside id="currentCard" class="current-card">
+            <div>
+                <div class="label">CURRENT SCENARIO</div>
+                <div id="scenarioName" class="scenario-name">读取中...</div>
+                <div id="scenarioDescription" class="scenario-description">正在获取模拟服务状态</div>
+            </div>
+            <div id="scenarioState" class="scenario-state">● 等待连接</div>
+        </aside>
+    </section>
+
+    <section class="panel">
+        <div class="panel-heading">
+            <h2>实时业务指标</h2>
+            <div id="lastUpdated" class="panel-hint">尚未更新</div>
+        </div>
+        <div class="metrics">
+            <div class="metric"><div class="metric-name">在线站点</div><div id="metricStations" class="metric-value">-- / --</div></div>
+            <div class="metric"><div class="metric-name">遥测队列深度</div><div id="metricQueue" class="metric-value">--</div></div>
+            <div class="metric"><div class="metric-name">同步失败率</div><div id="metricFailure" class="metric-value">--%</div></div>
+            <div class="metric"><div class="metric-name">数据新鲜度</div><div id="metricFreshness" class="metric-value">-- s</div></div>
+            <div class="metric"><div class="metric-name">处理延迟</div><div id="metricLatency" class="metric-value">-- s</div></div>
+        </div>
+    </section>
+
+    <section class="panel">
+        <div class="panel-heading">
+            <div>
+                <h2>场景注入</h2>
+                <div class="panel-hint" style="margin-top: 7px;">点击即可切换；Prometheus 告警通常在 20～30 秒内进入 FIRING</div>
+            </div>
+        </div>
+        <div id="scenarioGrid" class="scenario-grid"></div>
+        <div class="operation-strip">
+            <div class="operation-box">
+                <div class="operation-title">OPERATION STATUS</div>
+                <div id="operationStatus" class="operation-value">请选择要演示的运行场景</div>
+            </div>
+            <div class="operation-box">
+                <div class="operation-title">EXPECTED ALERT</div>
+                <div id="expectedAlert" class="operation-value">正常状态下无活动告警</div>
+            </div>
+        </div>
+    </section>
+
+    <div class="footer-note">
+        <span>ⓘ</span>
+        <span><strong>推荐演示：</strong>先选择“遥测消息积压”，等待告警进入 FIRING，再打开 AIOps 生成诊断报告；演示结束后点击“恢复正常”。</span>
+    </div>
+</main>
+
+<script>
+    const scenarios = [
+        {
+            key: 'normal', title: '恢复正常', severity: 'NORMAL', color: '#3ee2a0',
+            description: '恢复全部站点、同步链路和遥测处理指标。', alerts: []
+        },
+        {
+            key: 'communication_interruption', title: '站点通信中断', severity: 'CRITICAL', color: '#ff667a',
+            description: '模拟部分变电站采集通道中断、数据无法按时上送。', alerts: ['GridCommunicationInterrupted']
+        },
+        {
+            key: 'queue_backlog', title: '遥测消息积压', severity: 'WARNING', color: '#ffbd59',
+            description: '模拟消费能力不足，待处理遥测消息持续增长。', alerts: ['GridTelemetryQueueBacklog']
+        },
+        {
+            key: 'sync_failure', title: '数据同步失败', severity: 'CRITICAL', color: '#ff667a',
+            description: '模拟向主站同步时连续失败，失败率超过告警阈值。', alerts: ['GridDataSyncFailureRateHigh']
+        },
+        {
+            key: 'data_delay', title: '数据处理延迟', severity: 'WARNING', color: '#ffbd59',
+            description: '模拟数据新鲜度和遥测处理耗时同时恶化。', alerts: ['GridDataFreshnessDelayHigh', 'GridTelemetryProcessingLatencyHigh']
+        },
+        {
+            key: 'service_down', title: '服务不可用', severity: 'CRITICAL', color: '#ff667a',
+            description: '模拟指标端点不可用，使 Prometheus Target 抓取失败。', alerts: ['GridDataSyncServiceDown']
+        }
+    ];
+
+    const scenarioMap = Object.fromEntries(scenarios.map(item => [item.key, item]));
+    const elements = {
+        connection: document.getElementById('connection'),
+        connectionText: document.getElementById('connectionText'),
+        currentCard: document.getElementById('currentCard'),
+        scenarioName: document.getElementById('scenarioName'),
+        scenarioDescription: document.getElementById('scenarioDescription'),
+        scenarioState: document.getElementById('scenarioState'),
+        lastUpdated: document.getElementById('lastUpdated'),
+        metricStations: document.getElementById('metricStations'),
+        metricQueue: document.getElementById('metricQueue'),
+        metricFailure: document.getElementById('metricFailure'),
+        metricFreshness: document.getElementById('metricFreshness'),
+        metricLatency: document.getElementById('metricLatency'),
+        scenarioGrid: document.getElementById('scenarioGrid'),
+        operationStatus: document.getElementById('operationStatus'),
+        expectedAlert: document.getElementById('expectedAlert')
+    };
+
+    let currentScenario = null;
+    let busy = false;
+
+    function createScenarioButtons() {
+        scenarios.forEach(item => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'scenario-button';
+            button.dataset.scenario = item.key;
+            button.style.setProperty('--button-color', item.color);
+
+            const top = document.createElement('div');
+            top.className = 'button-top';
+            const title = document.createElement('span');
+            title.className = 'button-title';
+            title.textContent = item.title;
+            const severity = document.createElement('span');
+            severity.className = 'severity';
+            severity.textContent = item.severity;
+            top.append(title, severity);
+
+            const description = document.createElement('p');
+            description.className = 'button-description';
+            description.textContent = item.description;
+            const alert = document.createElement('div');
+            alert.className = 'button-alert';
+            alert.textContent = item.alerts.length ? item.alerts.join(' + ') : 'NO ACTIVE ALERT';
+
+            button.append(top, description, alert);
+            button.addEventListener('click', () => applyScenario(item.key));
+            elements.scenarioGrid.appendChild(button);
+        });
+    }
+
+    function formatNumber(value, digits = 0) {
+        const number = Number(value);
+        return Number.isFinite(number) ? number.toFixed(digits) : '--';
+    }
+
+    function setConnection(online) {
+        elements.connection.classList.toggle('online', online);
+        elements.connection.classList.toggle('offline', !online);
+        elements.connectionText.textContent = online ? '模拟服务在线 · 自动刷新' : '模拟服务连接失败';
+    }
+
+    function setOperation(message, type = '') {
+        elements.operationStatus.textContent = message;
+        elements.operationStatus.className = `operation-value ${type}`.trim();
+    }
+
+    function renderStatus(snapshot) {
+        const item = scenarioMap[snapshot.scenario] || scenarios[0];
+        const metrics = snapshot.metrics || {};
+        currentScenario = snapshot.scenario;
+
+        elements.currentCard.style.setProperty('--scenario-color', item.color);
+        elements.scenarioName.textContent = item.title;
+        elements.scenarioDescription.textContent = snapshot.scenario_description || item.description;
+        elements.scenarioState.textContent = snapshot.healthy ? '● 服务在线' : '● 模拟服务不可用';
+        elements.metricStations.textContent = `${formatNumber(metrics.grid_station_online)} / ${formatNumber(metrics.grid_station_total)}`;
+        elements.metricQueue.textContent = formatNumber(metrics.grid_telemetry_queue_depth);
+        elements.metricFailure.textContent = `${formatNumber(metrics.grid_data_sync_failure_rate, 1)}%`;
+        elements.metricFreshness.textContent = `${formatNumber(metrics.grid_data_freshness_seconds, 1)} s`;
+        elements.metricLatency.textContent = `${formatNumber(metrics.grid_telemetry_processing_latency_seconds, 2)} s`;
+        elements.lastUpdated.textContent = `更新时间 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+
+        document.querySelectorAll('.scenario-button').forEach(button => {
+            button.classList.toggle('active', button.dataset.scenario === snapshot.scenario);
+            button.disabled = busy;
+        });
+
+        if (!item.alerts.length) {
+            elements.expectedAlert.textContent = '正常状态下无活动告警';
+            elements.expectedAlert.className = 'operation-value success';
+            return;
+        }
+
+        const startedAt = Date.parse(snapshot.scenario_started_at);
+        const elapsedSeconds = Number.isFinite(startedAt) ? Math.max(0, (Date.now() - startedAt) / 1000) : 0;
+        const remaining = Math.max(0, Math.ceil(20 - elapsedSeconds));
+        if (remaining > 0) {
+            elements.expectedAlert.textContent = `${item.alerts.join('、')} · 预计 ${remaining}s 后生效`;
+            elements.expectedAlert.className = 'operation-value warning';
+        } else {
+            elements.expectedAlert.textContent = `${item.alerts.join('、')} · 应已进入 FIRING，请打开 Prometheus 确认`;
+            elements.expectedAlert.className = 'operation-value error';
+        }
+    }
+
+    async function refreshStatus({ quiet = true } = {}) {
+        try {
+            const response = await fetch('/api/status', { cache: 'no-store' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const snapshot = await response.json();
+            setConnection(true);
+            renderStatus(snapshot);
+        } catch (error) {
+            setConnection(false);
+            if (!quiet) setOperation(`读取状态失败：${error.message}`, 'error');
+        }
+    }
+
+    async function applyScenario(scenario) {
+        if (busy) return;
+        const item = scenarioMap[scenario];
+        busy = true;
+        document.querySelectorAll('.scenario-button').forEach(button => { button.disabled = true; });
+        setOperation(`正在切换到“${item.title}”...`, 'warning');
+
+        const endpoint = scenario === 'normal' ? '/api/recover' : `/api/scenario/${encodeURIComponent(scenario)}`;
+        try {
+            const response = await fetch(endpoint, { method: 'POST' });
+            const payload = await response.json();
+            if (!response.ok || !payload.success) {
+                throw new Error(payload.detail?.message || payload.message || `HTTP ${response.status}`);
+            }
+            renderStatus(payload.data);
+            setOperation(
+                scenario === 'normal'
+                    ? '已恢复正常场景，等待 Prometheus 自动清除告警'
+                    : `异常场景“${item.title}”注入成功`,
+                'success'
+            );
+        } catch (error) {
+            setOperation(`场景切换失败：${error.message}`, 'error');
+        } finally {
+            busy = false;
+            document.querySelectorAll('.scenario-button').forEach(button => { button.disabled = false; });
+            await refreshStatus();
+        }
+    }
+
+    createScenarioButtons();
+    refreshStatus({ quiet: false });
+    window.setInterval(() => refreshStatus(), 2000);
+</script>
+</body>
+</html>

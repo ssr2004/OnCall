@@ -17,7 +17,8 @@
 - `search_topic_by_service_name`
 - `search_log`
 
-CLS Server 当前仍使用演示数据，后续可在服务内部替换为真实日志平台适配器。
+CLS Server 当前从电网模拟服务读取场景日志，保证日志与告警、指标来自同一故障状态。
+后续可在服务内部替换为甲方日志平台适配器。
 
 ### Monitor Server (`monitor_server.py`)
 
@@ -26,8 +27,9 @@ Prometheus 监控适配服务，默认监听 `http://127.0.0.1:8004/mcp`。
 当前工具：
 
 - `list_active_alerts`：查询 Prometheus 当前 firing/pending 告警
-- `query_cpu_metrics`：查询指定服务的 CPU 使用率时间序列
-- `query_memory_metrics`：查询指定服务的内存使用率时间序列
+- `query_grid_service_status`：查询服务健康状态和站点在线情况
+- `query_grid_data_sync_metrics`：查询遥测队列积压和同步失败率
+- `query_grid_telemetry_metrics`：查询数据新鲜度、处理耗时和消息速率
 
 Monitor MCP 内部调用以下 Prometheus HTTP API：
 
@@ -35,7 +37,7 @@ Monitor MCP 内部调用以下 Prometheus HTTP API：
 - `GET /api/v1/query_range`
 
 Agent 只需要使用业务工具，不需要生成 PromQL，也不需要知道 Prometheus 地址、
-Exporter 指标名和认证配置。
+底层指标名和认证配置。
 
 ## Prometheus 配置
 
@@ -52,19 +54,19 @@ monitoring/prometheus.yml
 monitoring/alert-rules.yml
 ```
 
-本地 Windows 演示环境默认抓取：
+本地演示环境默认抓取电网模拟服务：
 
 ```text
-host.docker.internal:9182
+host.docker.internal:9105
 ```
 
-因此需要在 Windows 主机安装并启动 `windows_exporter`，监听 9182 端口。项目为该目标
-添加以下静态标签：
+模拟服务由项目启动脚本运行在 9105 端口，并为指标提供以下业务标签：
 
 ```text
-system=oncall-demo
-service=data-sync-service
-station=local-demo
+system=grid-oncall-demo
+region=demo-grid-region
+service=grid-data-sync-service
+station=demo-control-center
 ```
 
 Monitor MCP 默认使用 `service` 标签定位查询目标。
@@ -76,15 +78,10 @@ Monitor MCP 会读取项目根目录的 `.env`：
 ```dotenv
 PROMETHEUS_BASE_URL=http://127.0.0.1:9090
 PROMETHEUS_REQUEST_TIMEOUT=10
-MONITOR_EXPORTER_TYPE=windows
 PROMETHEUS_SERVICE_LABEL=service
+GRID_SIMULATOR_BASE_URL=http://127.0.0.1:9105
+GRID_SIMULATOR_REQUEST_TIMEOUT=10
 ```
-
-`MONITOR_EXPORTER_TYPE` 支持：
-
-- `windows`：使用 windows_exporter 指标
-- `node`：使用 node_exporter 指标
-- `auto`：同时尝试 Windows 和 Node Exporter 查询表达式
 
 生产环境如果使用不同的服务标签，例如 `app`，可设置：
 
@@ -115,6 +112,7 @@ Linux/macOS：
 ```bash
 make start-cls
 make start-monitor
+make start-grid-simulator
 make status-mcp
 ```
 
@@ -123,6 +121,7 @@ Windows：
 ```bat
 .venv\Scripts\python.exe mcp_servers\cls_server.py
 .venv\Scripts\python.exe mcp_servers\monitor_server.py
+.venv\Scripts\python.exe -m uvicorn grid_simulator.service:app --host 0.0.0.0 --port 9105
 ```
 
 也可以使用项目的 `start-windows.bat` 启动整套服务。
@@ -134,24 +133,24 @@ Windows：
 ```python
 list_active_alerts(
     severity="warning",
-    service_name="data-sync-service",
+    service_name="grid-data-sync-service",
 )
 ```
 
-查询最近一小时 CPU：
+查询服务健康和站点在线情况：
 
 ```python
-query_cpu_metrics(
-    service_name="data-sync-service",
+query_grid_service_status(
+    service_name="grid-data-sync-service",
     interval="1m",
 )
 ```
 
-查询指定时间范围的内存：
+查询指定时间范围的数据同步指标：
 
 ```python
-query_memory_metrics(
-    service_name="data-sync-service",
+query_grid_data_sync_metrics(
+    service_name="grid-data-sync-service",
     start_time="2026-07-26 10:00:00",
     end_time="2026-07-26 11:00:00",
     interval="5m",
@@ -175,8 +174,8 @@ Prometheus 不可用时工具返回结构化错误，不会静默切换为随机
 如果甲方已有 Prometheus：
 
 1. 将 `PROMETHEUS_BASE_URL` 指向内部 Prometheus。
-2. 根据甲方指标体系设置 `MONITOR_EXPORTER_TYPE`。
-3. 根据标签规范设置 `PROMETHEUS_SERVICE_LABEL`。
+2. 根据标签规范设置 `PROMETHEUS_SERVICE_LABEL`。
+3. 在 Monitor MCP 内将甲方指标映射为现有电网业务工具的返回结构。
 4. 在 Monitor MCP 内维护经过验证的 PromQL，不让 Agent 自行生成查询。
 
 如果甲方使用其他内部监控平台，可以保留 MCP 工具名称和返回结构，只替换 Monitor MCP

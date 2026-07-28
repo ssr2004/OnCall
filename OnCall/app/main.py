@@ -3,7 +3,7 @@
 主应用程序，配置路由、中间件、静态文件等
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -14,6 +14,9 @@ from app.config import config
 from loguru import logger
 from app.api import chat, health, file, aiops
 from app.core.milvus_client import milvus_manager
+
+
+FRONTEND_BUILD = "20260728-alert-status-v1"
 
 
 @asynccontextmanager
@@ -57,6 +60,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def disable_frontend_cache(request: Request, call_next):
+    """演示环境禁用前端缓存，确保页面更新后不会继续执行旧脚本。"""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["X-Frontend-Build"] = FRONTEND_BUILD
+    return response
 
 # 注册路由
 app.include_router(health.router, tags=["健康检查"])

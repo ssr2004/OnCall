@@ -6,9 +6,16 @@
 import logging
 import functools
 import json
+import os
+import time
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
+
+import httpx
+from dotenv import load_dotenv
 from fastmcp import FastMCP
+
+load_dotenv()
 
 # 配置日志
 logging.basicConfig(
@@ -18,6 +25,31 @@ logging.basicConfig(
 logger = logging.getLogger("CLS_MCP_Server")
 
 mcp = FastMCP("CLS")
+
+GRID_SIMULATOR_BASE_URL = os.getenv(
+    "GRID_SIMULATOR_BASE_URL", "http://127.0.0.1:9105"
+).rstrip("/")
+GRID_SIMULATOR_REQUEST_TIMEOUT = float(
+    os.getenv("GRID_SIMULATOR_REQUEST_TIMEOUT", "10")
+)
+
+
+def query_grid_simulator_logs(params: Dict[str, Any]) -> Dict[str, Any]:
+    """从电网模拟服务查询与当前故障场景一致的业务日志。"""
+    url = f"{GRID_SIMULATOR_BASE_URL}/api/logs"
+    try:
+        with httpx.Client(
+            timeout=GRID_SIMULATOR_REQUEST_TIMEOUT,
+            trust_env=False,
+        ) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            body = response.json()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"无法查询电网模拟服务日志: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError("电网模拟服务返回的日志不是合法 JSON") from exc
+    return body
 
 
 def log_tool_call(func):
@@ -101,6 +133,36 @@ def generate_time_series(base_time: datetime, minutes_offset: int) -> str:
     return result_time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def normalize_log_time(value: int | str) -> int:
+    """将毫秒时间戳、数字字符串或 RFC3339/本地时间转换为毫秒时间戳。"""
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.lower() in {
+        "now",
+        "current_time",
+        "current_timestamp",
+        "timestamp_placeholder",
+        "当前时间",
+    }:
+        # ToolNode 会并行执行同一轮的工具调用，模型无法先取得
+        # get_current_timestamp 的结果再填入 search_log。将常见的“当前时间”
+        # 占位值在工具边界收敛为真实时间，避免演示诊断因占位符失败。
+        return int(time.time() * 1000)
+    if text.isdigit():
+        return int(text)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        except ValueError as exc:
+            raise ValueError(
+                "日志时间必须是毫秒时间戳、YYYY-MM-DD HH:MM:SS 或 RFC3339"
+            ) from exc
+    return int(parsed.timestamp() * 1000)
+
+
 @mcp.tool()
 @log_tool_call
 def get_current_timestamp() -> int:
@@ -125,7 +187,7 @@ def get_current_timestamp() -> int:
         
         # 用于搜索最近15分钟的日志
         search_log(
-            topic_id="topic-001",
+            topic_id="grid-topic-001",
             start_time=fifteen_min_ago,
             end_time=current
         )
@@ -149,6 +211,8 @@ def get_region_code_by_name(region_name: str) -> Dict[str, Any]:
     """
     # 模拟地区映射表（实际应该从配置或数据库读取）
     region_mapping = {
+        "演示地区": {"region_code": "demo-grid-region", "region_name": "演示地区", "available": True},
+        "某地区": {"region_code": "demo-grid-region", "region_name": "某地区", "available": True},
         "北京": {"region_code": "ap-beijing", "region_name": "北京", "available": True},
         "上海": {"region_code": "ap-shanghai", "region_name": "上海", "available": True},
         "广州": {"region_code": "ap-guangzhou", "region_name": "广州", "available": True},
@@ -185,13 +249,13 @@ def get_topic_info_by_name(topic_name: str, region_code: Optional[str] = None) -
     """
     mock_topics = [
         {
-            "topic_id": "topic-001",
-            "topic_name": "数据同步服务日志",
-            "service_name": "data-sync-service",
-            "region_code": "ap-beijing",
-            "create_time": "2024-01-01 10:00:00",
+            "topic_id": "grid-topic-001",
+            "topic_name": "电网数据采集与同步服务日志",
+            "service_name": "grid-data-sync-service",
+            "region_code": "demo-grid-region",
+            "create_time": "2026-07-26 00:00:00",
             "log_count": 0,
-            "description": "服务应用日志"
+            "description": "电网模拟服务产生的实时业务场景日志"
         }
     ]
 
@@ -222,15 +286,15 @@ def search_topic_by_service_name(
     
     Args:
         service_name: 服务名称（必填）
-            示例: "data-sync-service", "sync", "data-sync"
+            示例: "grid-data-sync-service", "grid-data-sync"
             说明: 当 fuzzy=True 时，支持部分匹配
         
         region_code: 地区代码（可选）
-            示例: "ap-beijing", "ap-shanghai"
+            示例: "demo-grid-region"
             说明: 如果指定，只返回该地区的主题
         
         fuzzy: 是否启用模糊搜索（可选，默认 True）
-            True: 部分匹配，例如 "sync" 可以匹配 "data-sync-service"
+            True: 部分匹配，例如 "grid-data-sync" 可以匹配 "grid-data-sync-service"
             False: 精确匹配，必须完全一致
     
     Returns:
@@ -249,26 +313,26 @@ def search_topic_by_service_name(
     使用示例:
         # 示例1: 模糊搜索（推荐）
         search_topic_by_service_name(service_name="data-sync")
-        # 可以匹配: "data-sync-service", "data-sync-worker" 等
+        # 可以匹配: "grid-data-sync-service"
         
         # 示例2: 精确搜索
         search_topic_by_service_name(
-            service_name="data-sync-service",
+            service_name="grid-data-sync-service",
             fuzzy=False
         )
         
         # 示例3: 指定地区搜索
         search_topic_by_service_name(
             service_name="sync",
-            region_code="ap-beijing"
+            region_code="demo-grid-region"
         )
         
         # 示例4: 查找后进行日志搜索的完整流程
         # 步骤1: 根据服务名查找 topic
-        result = search_topic_by_service_name(service_name="data-sync-service")
+        result = search_topic_by_service_name(service_name="grid-data-sync-service")
         
         # 步骤2: 获取 topic_id
-        topic_id = result["topics"][0]["topic_id"]  # "topic-001"
+        topic_id = result["topics"][0]["topic_id"]  # "grid-topic-001"
         
         # 步骤3: 使用 topic_id 查询日志
         current_ts = get_current_timestamp()
@@ -282,31 +346,13 @@ def search_topic_by_service_name(
     # Mock 主题数据（实际应该从配置或数据库读取）
     mock_topics = [
         {
-            "topic_id": "topic-001",
-            "topic_name": "数据同步服务日志",
-            "service_name": "data-sync-service",
-            "region_code": "ap-beijing",
-            "create_time": "2024-01-01 10:00:00",
+            "topic_id": "grid-topic-001",
+            "topic_name": "电网数据采集与同步服务日志",
+            "service_name": "grid-data-sync-service",
+            "region_code": "demo-grid-region",
+            "create_time": "2026-07-26 00:00:00",
             "log_count": 0,
-            "description": "数据同步服务的应用日志，包含同步任务执行情况"
-        },
-        {
-            "topic_id": "topic-002",
-            "topic_name": "数据同步服务错误日志",
-            "service_name": "data-sync-service",
-            "region_code": "ap-beijing",
-            "create_time": "2024-01-01 10:00:00",
-            "log_count": 0,
-            "description": "数据同步服务的错误日志"
-        },
-        {
-            "topic_id": "topic-003",
-            "topic_name": "API网关服务日志",
-            "service_name": "api-gateway-service",
-            "region_code": "ap-shanghai",
-            "create_time": "2024-01-01 10:00:00",
-            "log_count": 0,
-            "description": "API网关服务日志"
+            "description": "电网模拟服务产生的实时业务场景日志"
         }
     ]
     
@@ -347,8 +393,8 @@ def search_topic_by_service_name(
 @log_tool_call
 def search_log(
     topic_id: str,
-    start_time: int,
-    end_time: int,
+    start_time: int | str,
+    end_time: int | str,
     query: Optional[str] = None,
     limit: int = 100
 ) -> Dict[str, Any]:
@@ -356,10 +402,9 @@ def search_log(
 
     Args:
         topic_id: 主题ID（必填）
-            示例: "topic-001"
+            当前电网模拟服务使用 "grid-topic-001"
         
-        start_time: 开始时间戳，单位为毫秒（必填，int类型）
-            重要: 必须传递整数类型的毫秒时间戳
+        start_time: 开始时间（必填），支持毫秒时间戳或 RFC3339 字符串
             获取方式: 
             1. 使用 get_current_timestamp() 工具获取当前时间戳
             2. 计算历史时间: current_timestamp - (分钟数 * 60 * 1000)
@@ -368,8 +413,7 @@ def search_log(
             - 15分钟前: 1708012345000 - (15 * 60 * 1000) = 1708011445000
             - 1小时前: 1708012345000 - (60 * 60 * 1000) = 1708008745000
         
-        end_time: 结束时间戳，单位为毫秒（必填，int类型）
-            重要: 必须传递整数类型的毫秒时间戳
+        end_time: 结束时间（必填），支持毫秒时间戳或 RFC3339 字符串
             通常使用 get_current_timestamp() 工具获取当前时间作为结束时间
             示例: 1708012345000
         
@@ -402,55 +446,30 @@ def search_log(
         
         # 步骤3: 搜索日志
         search_log(
-            topic_id="topic-001",
+            topic_id="grid-topic-001",
             start_time=start_ts,     # int类型: 1708011445000
             end_time=current_ts,     # int类型: 1708012345000
             limit=100
         )
     """
-    # 根据 topic_id 返回不同的结果
-    if topic_id == "topic-001":
-        # topic-001: 应用日志，动态生成 INFO 日志
-        logs = []
-        current_time_ms = start_time
-        count = 0
-
-        # 计算最大可生成的日志条数（基于时间范围）
-        max_logs_by_time = int((end_time - start_time) / (60 * 1000)) + 1
-
-        # 实际生成的日志数量取 limit 和时间范围内最大日志数的较小值
-        actual_limit = min(limit, max_logs_by_time)
-
-        while current_time_ms <= end_time and count < actual_limit:
-            # 将毫秒时间戳转换为可读格式
-            log_time = datetime.fromtimestamp(current_time_ms / 1000)
-            time_str = log_time.strftime("%Y-%m-%d %H:%M:%S")
-
-            log_entry = {
-                "timestamp": time_str,
-                "level": "INFO",
-                "message": "正在同步元数据……"
-            }
-
-            logs.append(log_entry)
-            count += 1
-
-            # 下一条日志时间增加1分钟（60秒 * 1000毫秒）
-            current_time_ms += 60 * 1000
-
+    raw_start_time = start_time
+    raw_end_time = end_time
+    try:
+        start_time = normalize_log_time(start_time)
+        end_time = normalize_log_time(end_time)
+    except ValueError as exc:
         return {
+            "success": False,
             "topic_id": topic_id,
-            "start_time": start_time,
-            "end_time": end_time,
-            "query": query,
-            "limit": limit,
-            "total": len(logs),
-            "logs": logs,
-            "took_ms": 50,
-            "message": f"成功查询 {len(logs)} 条应用日志"
+            "start_time": raw_start_time,
+            "end_time": raw_end_time,
+            "total": 0,
+            "logs": [],
+            "error": str(exc),
+            "message": "日志查询时间格式无效",
         }
-    else:
-        # 其他 topic_id: 返回错误，表示 topic 不存在
+
+    if topic_id != "grid-topic-001":
         return {
             "topic_id": topic_id,
             "start_time": start_time,
@@ -462,6 +481,75 @@ def search_log(
             "took_ms": 0,
             "error": f"主题不存在: {topic_id}",
             "message": f"错误: 未找到主题 {topic_id}，请检查 topic_id 是否正确"
+        }
+
+    requested_end_time = end_time
+    time_range_adjusted = False
+    if start_time >= end_time:
+        # 模型偶尔会把 activeAt 同时填入起止时间。演示查询应容错为“从告警前 5 分钟
+        # 到当前时间”，避免因为参数退化而丢失本来存在的故障日志。
+        end_time = max(int(time.time() * 1000), start_time + 60 * 1000)
+        time_range_adjusted = True
+
+    requested_levels: list[str] = []
+    if query:
+        upper_query = query.upper()
+        for candidate in ("ERROR", "WARN", "INFO"):
+            if f"LEVEL:{candidate}" in upper_query:
+                requested_levels.append(candidate)
+
+    # 告警通常在异常持续一个评估周期后触发，根因日志会早于 activeAt。自动向前扩展
+    # 5 分钟，避免只从 activeAt 开始查询而漏掉最初的异常日志。
+    effective_start_time = max(0, start_time - 5 * 60 * 1000)
+
+    started_at = time.perf_counter()
+    try:
+        body = query_grid_simulator_logs(
+            {
+                "start_time": effective_start_time,
+                "end_time": end_time,
+                "level": requested_levels[0] if len(requested_levels) == 1 else None,
+                "limit": max(1, min(limit, 500)),
+            }
+        )
+        logs = body.get("logs", [])
+        if len(requested_levels) > 1:
+            logs = [
+                item for item in logs
+                if str(item.get("level", "")).upper() in requested_levels
+            ]
+        return {
+            "success": True,
+            "source": "grid-simulator",
+            "topic_id": topic_id,
+            "service_name": "grid-data-sync-service",
+            "scenario": body.get("scenario", "unknown"),
+            "start_time": start_time,
+            "effective_start_time": effective_start_time,
+            "end_time": end_time,
+            "requested_end_time": requested_end_time,
+            "time_range_adjusted": time_range_adjusted,
+            "query": query,
+            "limit": limit,
+            "total": len(logs),
+            "logs": logs,
+            "took_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "message": f"已从电网模拟服务查询 {len(logs)} 条业务日志",
+        }
+    except RuntimeError as exc:
+        return {
+            "success": False,
+            "source": "grid-simulator",
+            "topic_id": topic_id,
+            "start_time": start_time,
+            "end_time": end_time,
+            "query": query,
+            "limit": limit,
+            "total": 0,
+            "logs": [],
+            "took_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "error": str(exc),
+            "message": "电网模拟服务日志查询失败",
         }
 
 

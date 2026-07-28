@@ -210,11 +210,115 @@ body {
     position: relative;
 }
 
-/* AI Ops按钮 - 右上角 */
-.ai-ops-top-btn {
+/* 右上角告警状态与 AI Ops 操作区 */
+.top-action-bar {
     position: absolute;
     top: 16px;
     right: 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    z-index: 100;
+}
+
+.alert-status-link {
+    min-height: 40px;
+    padding: 9px 13px;
+    border: 1px solid transparent;
+    border-radius: 22px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: #4b5563;
+    background: #f3f4f6;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1;
+    text-decoration: none;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);
+}
+
+.alert-status-link:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 10px rgba(15, 23, 42, 0.14);
+}
+
+.alert-status-dot {
+    position: relative;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+}
+
+.alert-status-count {
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: inherit;
+    background: rgba(255, 255, 255, 0.75);
+    font-size: 11px;
+    line-height: 20px;
+}
+
+.alert-status-count[hidden] {
+    display: none;
+}
+
+.alert-status-healthy {
+    color: #137333;
+    background: #e6f4ea;
+    border-color: #b7dfc2;
+}
+
+.alert-status-pending {
+    color: #9a6700;
+    background: #fef7e0;
+    border-color: #f6d97a;
+}
+
+.alert-status-firing {
+    color: #b3261e;
+    background: #fce8e6;
+    border-color: #f4b7b2;
+}
+
+.alert-status-firing .alert-status-dot::after {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border: 2px solid currentColor;
+    border-radius: 50%;
+    animation: alertStatusPulse 1.7s ease-out infinite;
+}
+
+.alert-status-unavailable {
+    color: #7c5c00;
+    background: #fff4ce;
+    border-color: #ead184;
+}
+
+.alert-status-loading {
+    color: #5f6368;
+    background: #f1f3f4;
+    border-color: #dadce0;
+}
+
+@keyframes alertStatusPulse {
+    0% { transform: scale(0.55); opacity: 0.75; }
+    80%, 100% { transform: scale(1.45); opacity: 0; }
+}
+
+.ai-ops-top-btn {
+    position: static;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -227,7 +331,6 @@ body {
     font-size: 14px;
     font-weight: 500;
     transition: all 0.2s;
-    z-index: 100;
     box-shadow: 0 2px 4px rgba(255, 152, 0, 0.3);
 }
 
@@ -241,6 +344,24 @@ body {
     width: 18px;
     height: 18px;
     flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+    .top-action-bar {
+        top: 12px;
+        right: 12px;
+        gap: 6px;
+    }
+
+    .alert-status-link {
+        min-height: 38px;
+        padding: 8px 10px;
+        font-size: 12px;
+    }
+
+    .ai-ops-top-btn {
+        padding: 9px 12px;
+    }
 }
 
 .chat-container {
@@ -990,6 +1111,179 @@ body {
     max-width: 100%;
     background: rgba(26, 115, 232, 0.05);
     border: 1px solid rgba(26, 115, 232, 0.2);
+}
+
+.aiops-message .message-content.aiops-progress-shell {
+    padding: 0;
+    background: transparent;
+    border: 0;
+    border-radius: 16px;
+    overflow: visible;
+}
+
+.aiops-progress-card {
+    width: min(680px, 100%);
+    padding: 20px;
+    border: 1px solid rgba(26, 115, 232, 0.18);
+    border-radius: 16px;
+    background: linear-gradient(145deg, #ffffff 0%, #f7faff 100%);
+    box-shadow: 0 10px 28px rgba(33, 82, 137, 0.09);
+}
+
+.aiops-progress-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.aiops-progress-identity {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+}
+
+.aiops-progress-pulse {
+    position: relative;
+    width: 12px;
+    height: 12px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: #1a73e8;
+    box-shadow: 0 0 0 5px rgba(26, 115, 232, 0.1);
+}
+
+.aiops-progress-pulse::after {
+    content: "";
+    position: absolute;
+    inset: -5px;
+    border: 1px solid rgba(26, 115, 232, 0.35);
+    border-radius: inherit;
+    animation: aiopsPulse 1.8s ease-out infinite;
+}
+
+.aiops-progress-title {
+    color: #172b4d;
+    font-size: 1rem;
+    font-weight: 650;
+    line-height: 1.4;
+}
+
+.aiops-progress-subtitle {
+    margin-top: 2px;
+    color: #71839a;
+    font-size: 0.75rem;
+}
+
+.aiops-progress-count {
+    flex: 0 0 auto;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: rgba(26, 115, 232, 0.08);
+    color: #1a73e8;
+    font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.78rem;
+    font-weight: 700;
+}
+
+.aiops-progress-track {
+    height: 7px;
+    margin: 18px 0;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #e8eef6;
+}
+
+.aiops-progress-bar {
+    height: 100%;
+    min-width: 8%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #1a73e8, #42a5f5);
+    box-shadow: 0 0 12px rgba(26, 115, 232, 0.24);
+    transition: width 280ms ease;
+}
+
+.aiops-current-step {
+    display: grid;
+    grid-template-columns: 72px minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    padding: 13px 14px;
+    border-radius: 11px;
+    background: #f1f6fc;
+}
+
+.aiops-current-label {
+    color: #71839a;
+    font-size: 0.76rem;
+    line-height: 1.65;
+}
+
+.aiops-current-value {
+    color: #263b55;
+    font-size: 0.87rem;
+    font-weight: 550;
+    line-height: 1.6;
+}
+
+.aiops-live-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    color: #62758d;
+    font-size: 0.78rem;
+}
+
+.aiops-live-dot {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: #34a853;
+    box-shadow: 0 0 0 4px rgba(52, 168, 83, 0.1);
+}
+
+.aiops-plan-preview {
+    margin-top: 15px;
+    padding-top: 13px;
+    border-top: 1px solid #e5edf6;
+    color: #52677f;
+    font-size: 0.78rem;
+}
+
+.aiops-plan-preview summary {
+    width: fit-content;
+    color: #1a73e8;
+    cursor: pointer;
+    font-weight: 550;
+    user-select: none;
+}
+
+.aiops-plan-preview ol {
+    max-height: 230px;
+    margin: 12px 0 0;
+    padding: 12px 12px 12px 32px;
+    overflow-y: auto;
+    border-radius: 10px;
+    background: #f7f9fc;
+}
+
+.aiops-plan-preview li {
+    padding: 5px 0;
+    line-height: 1.55;
+}
+
+@keyframes aiopsPulse {
+    0% { transform: scale(0.7); opacity: 0.85; }
+    75%, 100% { transform: scale(1.5); opacity: 0; }
+}
+
+@media (max-width: 640px) {
+    .aiops-progress-card { padding: 16px; }
+    .aiops-current-step { grid-template-columns: 1fr; gap: 4px; }
+    .aiops-progress-subtitle { display: none; }
 }
 
 /* 详情折叠区域 */

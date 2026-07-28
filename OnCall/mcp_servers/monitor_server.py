@@ -33,15 +33,15 @@ PROMETHEUS_BASE_URL = os.getenv(
     "PROMETHEUS_BASE_URL", "http://127.0.0.1:9090"
 ).rstrip("/")
 PROMETHEUS_REQUEST_TIMEOUT = float(os.getenv("PROMETHEUS_REQUEST_TIMEOUT", "10"))
-MONITOR_EXPORTER_TYPE = os.getenv("MONITOR_EXPORTER_TYPE", "windows").strip().lower()
 PROMETHEUS_SERVICE_LABEL = os.getenv("PROMETHEUS_SERVICE_LABEL", "service").strip()
 
-QUERY_API_PATH = "/api/v1/query"
 QUERY_RANGE_API_PATH = "/api/v1/query_range"
 ALERTS_API_PATH = "/api/v1/alerts"
 
-CPU_ALERT_THRESHOLD = 80.0
-MEMORY_ALERT_THRESHOLD = 70.0
+QUEUE_BACKLOG_THRESHOLD = 1000.0
+SYNC_FAILURE_RATE_THRESHOLD = 20.0
+DATA_FRESHNESS_THRESHOLD = 30.0
+PROCESSING_LATENCY_THRESHOLD = 2.0
 
 
 class PrometheusError(RuntimeError):
@@ -85,11 +85,6 @@ def log_tool_call(func):
 
 
 def _validate_configuration() -> None:
-    if MONITOR_EXPORTER_TYPE not in {"windows", "node", "auto"}:
-        raise ValueError(
-            "MONITOR_EXPORTER_TYPE 必须是 windows、node 或 auto，"
-            f"当前值为 {MONITOR_EXPORTER_TYPE!r}"
-        )
     if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", PROMETHEUS_SERVICE_LABEL):
         raise ValueError(
             "PROMETHEUS_SERVICE_LABEL 不是合法的 Prometheus 标签名: "
@@ -107,6 +102,17 @@ def parse_time_or_default(time_str: Optional[str], default_offset_hours: int = 0
         return datetime.now().astimezone() + timedelta(hours=default_offset_hours)
 
     value = time_str.strip()
+    if value.lower() in {
+        "now",
+        "current_time",
+        "current_timestamp",
+        "timestamp_placeholder",
+        "当前时间",
+    }:
+        # LLM 可能同时发起“取当前时间”和“查指标”两个工具调用，后一个调用
+        # 无法消费前一个调用的结果。把常见占位值按该参数的默认偏移解析，
+        # start_time 会得到一小时前，end_time 会得到当前时间。
+        return datetime.now().astimezone() + timedelta(hours=default_offset_hours)
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
@@ -174,38 +180,15 @@ def _prometheus_get(path: str, params: Optional[dict[str, Any]] = None) -> dict[
     return body
 
 
-def _cpu_query(service_name: str, exporter_type: str) -> str:
-    matcher = _service_matcher(service_name)
-    if exporter_type == "node":
-        return (
-            "100 - (avg by (instance, job, service, system, station) "
-            f"(rate(node_cpu_seconds_total{{{matcher},mode=\"idle\"}}[5m])) * 100)"
-        )
-    if exporter_type == "windows":
-        return (
-            "100 - (avg by (instance, job, service, system, station) "
-            f"(rate(windows_cpu_time_total{{{matcher},mode=\"idle\"}}[5m])) * 100)"
-        )
-    return f"({_cpu_query(service_name, 'windows')}) or ({_cpu_query(service_name, 'node')})"
+def _metric_query(service_name: str, metric_name: str) -> str:
+    return f"{metric_name}{{{_service_matcher(service_name)}}}"
 
 
-def _memory_query(service_name: str, exporter_type: str) -> str:
-    matcher = _service_matcher(service_name)
-    if exporter_type == "node":
-        return (
-            "(1 - ("
-            f"node_memory_MemAvailable_bytes{{{matcher}}} / "
-            f"node_memory_MemTotal_bytes{{{matcher}}}"
-            ")) * 100"
-        )
-    if exporter_type == "windows":
-        return (
-            "(1 - ("
-            f"windows_os_physical_memory_free_bytes{{{matcher}}} / "
-            f"windows_cs_physical_memory_bytes{{{matcher}}}"
-            ")) * 100"
-        )
-    return f"({_memory_query(service_name, 'windows')}) or ({_memory_query(service_name, 'node')})"
+def _message_rate_query(service_name: str) -> str:
+    return (
+        "rate(grid_telemetry_messages_total"
+        f"{{{_service_matcher(service_name)}}}[1m])"
+    )
 
 
 def _parse_matrix(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -268,9 +251,9 @@ def _statistics(series: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _metric_error(
+def _metric_group_error(
     service_name: str,
-    metric_name: str,
+    group_name: str,
     message: str,
     error_type: str,
 ) -> dict[str, Any]:
@@ -278,21 +261,21 @@ def _metric_error(
         "success": False,
         "source": "prometheus",
         "service_name": service_name,
-        "metric_name": metric_name,
+        "metric_group": group_name,
         "error_type": error_type,
         "message": message,
     }
 
 
-def _query_metric(
+def _query_metric_group(
     service_name: str,
-    metric_name: str,
-    query_builder,
-    threshold: float,
+    group_name: str,
+    metric_queries: dict[str, dict[str, Any]],
     start_time: Optional[str],
     end_time: Optional[str],
     interval: str,
 ) -> dict[str, Any]:
+    """查询一组电网业务指标并给出统一的统计与异常判断。"""
     try:
         start_dt = parse_time_or_default(start_time, default_offset_hours=-1)
         end_dt = parse_time_or_default(end_time)
@@ -300,84 +283,87 @@ def _query_metric(
         if start_dt >= end_dt:
             raise ValueError("start_time 必须早于 end_time")
 
-        promql = query_builder(service_name, MONITOR_EXPORTER_TYPE)
-        body = _prometheus_get(
-            QUERY_RANGE_API_PATH,
-            {
-                "query": promql,
-                "start": start_dt.timestamp(),
-                "end": end_dt.timestamp(),
-                "step": step,
-            },
-        )
-        series = _parse_matrix(body.get("data", {}))
-        stats = _statistics(series)
-
-        if not stats:
-            return {
-                "success": True,
-                "source": "prometheus",
-                "service_name": service_name,
-                "metric_name": metric_name,
-                "exporter_type": MONITOR_EXPORTER_TYPE,
-                "interval": step,
-                "time_range": {
-                    "start": start_dt.isoformat(),
-                    "end": end_dt.isoformat(),
+        metrics: dict[str, Any] = {}
+        anomalies: list[dict[str, Any]] = []
+        for metric_key, spec in metric_queries.items():
+            promql = str(spec["promql"])
+            body = _prometheus_get(
+                QUERY_RANGE_API_PATH,
+                {
+                    "query": promql,
+                    "start": start_dt.timestamp(),
+                    "end": end_dt.timestamp(),
+                    "step": step,
                 },
-                "data_points": [],
+            )
+            series = _parse_matrix(body.get("data", {}))
+            stats = _statistics(series)
+            metric_result = {
+                "metric_name": spec["metric_name"],
+                "description": spec["description"],
+                "unit": spec["unit"],
                 "series": series,
-                "statistics": {},
-                "alert_info": {
-                    "triggered": False,
-                    "threshold": threshold,
-                    "message": "Prometheus 查询成功，但没有匹配的时序数据",
-                },
+                "statistics": stats,
                 "query_metadata": {
                     "service_label": PROMETHEUS_SERVICE_LABEL,
                     "promql": promql,
                 },
-                "message": (
-                    f"未找到服务 {service_name!r} 的 {metric_name} 数据，请检查服务标签、"
-                    "Exporter 抓取状态和时间范围"
-                ),
             }
+            metrics[metric_key] = metric_result
 
-        triggered = stats["max"] > threshold
+            threshold = spec.get("threshold")
+            comparator = spec.get("comparator", "gt")
+            if stats and threshold is not None:
+                observed = stats["min"] if comparator == "lt" else stats["max"]
+                triggered = observed < threshold if comparator == "lt" else observed > threshold
+                if triggered:
+                    anomalies.append(
+                        {
+                            "metric": metric_key,
+                            "observed": observed,
+                            "threshold": threshold,
+                            "comparator": comparator,
+                            "message": spec["alert_message"],
+                        }
+                    )
+
+        # 在线站点数量需要与同一时刻的站点总数比较，而不是固定阈值。
+        if "station_online" in metrics and "station_total" in metrics:
+            online_stats = metrics["station_online"]["statistics"]
+            total_stats = metrics["station_total"]["statistics"]
+            if online_stats and total_stats and online_stats["current"] < total_stats["current"]:
+                anomalies.append(
+                    {
+                        "metric": "station_online",
+                        "observed": online_stats["current"],
+                        "threshold": total_stats["current"],
+                        "comparator": "lt",
+                        "message": "在线站点数量低于应接入站点总数",
+                    }
+                )
+
+        available_count = sum(1 for item in metrics.values() if item["statistics"])
         return {
             "success": True,
             "source": "prometheus",
             "service_name": service_name,
-            "metric_name": metric_name,
-            "exporter_type": MONITOR_EXPORTER_TYPE,
+            "metric_group": group_name,
             "interval": step,
             "time_range": {
                 "start": start_dt.isoformat(),
                 "end": end_dt.isoformat(),
             },
-            # 保留旧工具的 data_points 字段，默认呈现第一条目标序列。
-            "data_points": series[0]["data_points"] if series else [],
-            "series": series,
-            "statistics": stats,
-            "alert_info": {
-                "triggered": triggered,
-                "threshold": threshold,
-                "message": (
-                    f"{metric_name} 最大值 {stats['max']}% 超过 {threshold}% 阈值"
-                    if triggered
-                    else f"{metric_name} 未超过 {threshold}% 阈值"
-                ),
-            },
-            "query_metadata": {
-                "service_label": PROMETHEUS_SERVICE_LABEL,
-                "promql": promql,
-            },
-            "message": f"已从 Prometheus 获取 {len(series)} 条目标序列",
+            "metrics": metrics,
+            "anomalies": anomalies,
+            "message": (
+                f"已查询 {len(metrics)} 项电网业务指标，其中 {available_count} 项包含数据，"
+                f"发现 {len(anomalies)} 项异常"
+            ),
         }
     except ValueError as exc:
-        return _metric_error(service_name, metric_name, str(exc), "invalid_argument")
+        return _metric_group_error(service_name, group_name, str(exc), "invalid_argument")
     except PrometheusError as exc:
-        return _metric_error(service_name, metric_name, str(exc), "prometheus_error")
+        return _metric_group_error(service_name, group_name, str(exc), "prometheus_error")
 
 
 def _parse_active_at(active_at: str) -> Optional[datetime]:
@@ -495,22 +481,42 @@ def list_active_alerts(
 
 @mcp.tool()
 @log_tool_call
-def query_cpu_metrics(
+def query_grid_service_status(
     service_name: str,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
     interval: str = "1m",
 ) -> dict[str, Any]:
-    """查询指定服务最近一段时间的 CPU 使用率。
+    """查询电网数据服务健康状态和站点在线情况。
 
-    当告警、日志或用户描述涉及高负载、响应缓慢、任务积压时调用。service_name 应对应
-    Prometheus 中配置的 service 标签；默认查询最近一小时，可指定本地时间或 RFC3339 时间。
+    当告警涉及服务不可用、站点离线或采集通道中断时调用。默认查询最近一小时。
     """
-    return _query_metric(
+    return _query_metric_group(
         service_name=service_name,
-        metric_name="cpu_usage_percent",
-        query_builder=_cpu_query,
-        threshold=CPU_ALERT_THRESHOLD,
+        group_name="grid_service_status",
+        metric_queries={
+            "service_health": {
+                "metric_name": "grid_service_health",
+                "description": "电网数据同步服务健康状态",
+                "unit": "boolean",
+                "promql": _metric_query(service_name, "grid_service_health"),
+                "threshold": 1.0,
+                "comparator": "lt",
+                "alert_message": "服务健康状态异常",
+            },
+            "station_online": {
+                "metric_name": "grid_station_online",
+                "description": "当前在线站点数量",
+                "unit": "stations",
+                "promql": _metric_query(service_name, "grid_station_online"),
+            },
+            "station_total": {
+                "metric_name": "grid_station_total",
+                "description": "应接入站点总数",
+                "unit": "stations",
+                "promql": _metric_query(service_name, "grid_station_total"),
+            },
+        },
         start_time=start_time,
         end_time=end_time,
         interval=interval,
@@ -519,22 +525,84 @@ def query_cpu_metrics(
 
 @mcp.tool()
 @log_tool_call
-def query_memory_metrics(
+def query_grid_data_sync_metrics(
     service_name: str,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
     interval: str = "1m",
 ) -> dict[str, Any]:
-    """查询指定服务最近一段时间的内存使用率。
+    """查询电网遥测队列积压和数据同步失败率。
 
-    当告警、日志或用户描述涉及内存压力、OOM、进程被终止或持续资源增长时调用。
-    service_name 应对应 Prometheus 中配置的 service 标签；默认查询最近一小时。
+    当告警涉及消息积压、数据同步失败或下游接口异常时调用。默认查询最近一小时。
     """
-    return _query_metric(
+    return _query_metric_group(
         service_name=service_name,
-        metric_name="memory_usage_percent",
-        query_builder=_memory_query,
-        threshold=MEMORY_ALERT_THRESHOLD,
+        group_name="grid_data_sync",
+        metric_queries={
+            "queue_depth": {
+                "metric_name": "grid_telemetry_queue_depth",
+                "description": "待处理遥测消息数量",
+                "unit": "messages",
+                "promql": _metric_query(service_name, "grid_telemetry_queue_depth"),
+                "threshold": QUEUE_BACKLOG_THRESHOLD,
+                "alert_message": "遥测消息队列超过 1000 条",
+            },
+            "sync_failure_rate": {
+                "metric_name": "grid_data_sync_failure_rate",
+                "description": "数据同步失败率",
+                "unit": "percent",
+                "promql": _metric_query(service_name, "grid_data_sync_failure_rate"),
+                "threshold": SYNC_FAILURE_RATE_THRESHOLD,
+                "alert_message": "数据同步失败率超过 20%",
+            },
+        },
+        start_time=start_time,
+        end_time=end_time,
+        interval=interval,
+    )
+
+
+@mcp.tool()
+@log_tool_call
+def query_grid_telemetry_metrics(
+    service_name: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    interval: str = "1m",
+) -> dict[str, Any]:
+    """查询电网遥测数据新鲜度、处理耗时和消息处理速率。
+
+    当告警涉及数据延迟、数据长时间未更新或处理性能下降时调用。默认查询最近一小时。
+    """
+    return _query_metric_group(
+        service_name=service_name,
+        group_name="grid_telemetry",
+        metric_queries={
+            "data_freshness": {
+                "metric_name": "grid_data_freshness_seconds",
+                "description": "最新同步数据距当前时间的秒数",
+                "unit": "seconds",
+                "promql": _metric_query(service_name, "grid_data_freshness_seconds"),
+                "threshold": DATA_FRESHNESS_THRESHOLD,
+                "alert_message": "遥测数据超过 30 秒未更新",
+            },
+            "processing_latency": {
+                "metric_name": "grid_telemetry_processing_latency_seconds",
+                "description": "单批遥测数据处理耗时",
+                "unit": "seconds",
+                "promql": _metric_query(
+                    service_name, "grid_telemetry_processing_latency_seconds"
+                ),
+                "threshold": PROCESSING_LATENCY_THRESHOLD,
+                "alert_message": "遥测处理耗时超过 2 秒",
+            },
+            "message_rate": {
+                "metric_name": "grid_telemetry_message_rate",
+                "description": "每秒处理的遥测消息数量",
+                "unit": "messages_per_second",
+                "promql": _message_rate_query(service_name),
+            },
+        },
         start_time=start_time,
         end_time=end_time,
         interval=interval,
@@ -543,9 +611,8 @@ def query_memory_metrics(
 
 _validate_configuration()
 logger.info(
-    "Monitor MCP configured: prometheus=%s exporter=%s service_label=%s",
+    "Monitor MCP configured: prometheus=%s service_label=%s",
     PROMETHEUS_BASE_URL,
-    MONITOR_EXPORTER_TYPE,
     PROMETHEUS_SERVICE_LABEL,
 )
 

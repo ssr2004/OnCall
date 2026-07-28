@@ -8,6 +8,7 @@ from typing import Annotated, Any, AsyncGenerator, Dict, Sequence
 
 from langchain.agents import create_agent
 from langchain_core.messages import (
+    AIMessage,
     BaseMessage,
     HumanMessage,
     RemoveMessage,
@@ -173,6 +174,7 @@ class RagAgentService:
             2. 当需要获取实时信息或专业知识时，主动使用相关工具
             3. 基于工具返回的结果提供准确、专业的回答
             4. 如果工具无法提供足够信息，请诚实地告知用户
+            5. 如果会话中包含 AIOps 历史诊断报告：用户询问“上面、刚才、这次告警”时，优先依据该报告回答；用户询问“现在、当前、是否恢复”时，重新查询实时监控数据，并明确区分历史诊断与当前状态
 
             回答要求:
             - 保持友好、专业的语气
@@ -182,6 +184,73 @@ class RagAgentService:
 
             请根据用户的问题，灵活使用可用工具，提供高质量的帮助。
         """).strip()
+
+    async def record_aiops_report(self, session_id: str, report: str) -> bool:
+        """将 AIOps 最终报告交接到普通对话的同一会话上下文。
+
+        AIOps 工作流和普通对话使用不同的 LangGraph 状态结构，因此不能直接
+        共享 checkpointer。这里把最终报告转换为一轮隐藏触发消息和助手回复，
+        使后续追问能够引用诊断快照，同时不把执行过程写入聊天上下文。
+
+        Returns:
+            bool: 本次是否新增了报告；相同报告已存在时返回 False。
+        """
+        normalized_report = report.strip()
+        if not session_id or not normalized_report:
+            return False
+
+        await self._initialize_agent()
+        config_dict = {
+            "configurable": {
+                "thread_id": session_id
+            }
+        }
+
+        current_state = await self.agent.aget_state(config_dict)
+        current_messages = (
+            current_state.values.get("messages", [])
+            if current_state and current_state.values
+            else []
+        )
+        for message in current_messages:
+            metadata = getattr(message, "additional_kwargs", {}) or {}
+            if (
+                isinstance(message, AIMessage)
+                and metadata.get("source") == "aiops_report"
+                and message.content == normalized_report
+            ):
+                logger.info(f"[会话 {session_id}] AIOps 报告已存在，跳过重复交接")
+                return False
+
+        context_instruction = (
+            "请记住以下刚刚完成的 AIOps 诊断报告。它是诊断时刻的历史快照："
+            "后续询问‘上面、刚才、这次告警’时应依据报告回答；"
+            "询问‘现在、当前、是否恢复’时应重新查询实时监控数据，"
+            "不要用当前无告警否定历史上已经发生的告警。"
+        )
+        await self.agent.aupdate_state(
+            config_dict,
+            {
+                "messages": [
+                    HumanMessage(
+                        content=context_instruction,
+                        additional_kwargs={
+                            "source": "aiops_context_handoff",
+                            "hidden_from_history": True,
+                        },
+                    ),
+                    AIMessage(
+                        content=normalized_report,
+                        additional_kwargs={
+                            "source": "aiops_report",
+                            "historical_snapshot": True,
+                        },
+                    ),
+                ]
+            },
+        )
+        logger.info(f"[会话 {session_id}] AIOps 最终报告已交接到普通对话上下文")
+        return True
 
     async def query(
         self,
@@ -332,20 +401,20 @@ class RagAgentService:
             # 使用 checkpointer 的 get 方法获取最新的检查点
             config = {"configurable": {"thread_id": session_id}}
             
-            # 获取该 thread 的最新检查点
-            checkpoint_tuple = self.checkpointer.get(config)
+            # 新版 MemorySaver.get() 直接返回 checkpoint 字典；旧版或测试替身
+            # 可能返回带 checkpoint 属性的对象或元组，因此需要兼容处理。
+            checkpoint_result = self.checkpointer.get(config)
             
-            if not checkpoint_tuple:
+            if not checkpoint_result:
                 logger.info(f"获取会话历史: {session_id}, 消息数量: 0")
                 return []
             
-            # checkpoint_tuple 可能是命名元组或普通元组，安全地提取 checkpoint
-            # 通常第一个元素是 checkpoint 数据
-            if hasattr(checkpoint_tuple, 'checkpoint'):
-                checkpoint_data = checkpoint_tuple.checkpoint  # type: ignore
+            if isinstance(checkpoint_result, dict):
+                checkpoint_data = checkpoint_result
+            elif hasattr(checkpoint_result, 'checkpoint'):
+                checkpoint_data = checkpoint_result.checkpoint  # type: ignore
             else:
-                # 如果是普通元组，第一个元素是 checkpoint
-                checkpoint_data = checkpoint_tuple[0] if checkpoint_tuple else {}
+                checkpoint_data = checkpoint_result[0] if checkpoint_result else {}
             
             # 从检查点中提取消息
             messages = checkpoint_data.get("channel_values", {}).get("messages", [])
@@ -355,6 +424,10 @@ class RagAgentService:
             for msg in messages:
                 # 跳过系统消息
                 if isinstance(msg, SystemMessage):
+                    continue
+
+                metadata = getattr(msg, "additional_kwargs", {}) or {}
+                if metadata.get("hidden_from_history"):
                     continue
                     
                 role = "user" if isinstance(msg, HumanMessage) else "assistant"

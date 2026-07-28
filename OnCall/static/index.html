@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>智能OnCall助手</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20260728-alert-status-v1">
     <!-- Markdown 渲染库 -->
     <script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
     <!-- 代码高亮库（可选） -->
@@ -41,14 +41,29 @@
 
         <!-- 主内容区域 -->
         <main class="main-content">
-            <button class="ai-ops-top-btn" id="aiOpsSidebarBtn">
-                <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M2 17L12 22L22 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M2 12L12 17L22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-                <span>AI Ops</span>
-            </button>
+            <div class="top-action-bar">
+                <a
+                    class="alert-status-link alert-status-loading"
+                    id="alertStatusLink"
+                    href="http://localhost:9090/alerts"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="打开 Prometheus 告警页面"
+                    aria-label="告警状态读取中，点击打开 Prometheus 告警页面"
+                >
+                    <span class="alert-status-dot" aria-hidden="true"></span>
+                    <span class="alert-status-label" id="alertStatusLabel" aria-live="polite">状态读取中</span>
+                    <span class="alert-status-count" id="alertStatusCount" hidden></span>
+                </a>
+                <button class="ai-ops-top-btn" id="aiOpsSidebarBtn">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 17L12 22L22 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 12L12 17L22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <span>AI Ops</span>
+                </button>
+            </div>
             <div class="chat-container">
                 <div class="welcome-greeting" id="welcomeGreeting">
                     <p>你好！我是智能Oncall小助手</p>
@@ -127,6 +142,9 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script>
+        window.__FRONTEND_BUILD__ = '20260728-aiops-context-v2';
+    </script>
+    <script src="/static/app.js?v=20260728-aiops-context-v2"></script>
 </body>
 </html>

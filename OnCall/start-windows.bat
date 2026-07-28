@@ -1,171 +1,229 @@
 @echo off
 chcp 65001 >nul
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
+
+if /I "%~1"=="--encoding-check" (
+    echo START_SCRIPT_CHECK_OK
+    exit /b 0
+)
 
 echo ====================================
-echo 启动 SuperBizAgent 服务
+echo Starting SuperBizAgent services
 echo ====================================
 echo.
 
-REM 检查 uv 是否安装（可选，如果没有会使用 pip）
-echo [1/6] 检查包管理器...
+REM Fail fast when the Docker CLI or Docker Desktop engine is unavailable.
+where docker >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Docker CLI was not found. Install Docker Desktop first.
+    exit /b 1
+)
+docker info >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Docker Desktop engine is not running.
+    echo [TIP] Start Docker Desktop and wait until the engine is ready, then run this script again.
+    exit /b 1
+)
+if /I "%~1"=="--preflight-check" (
+    echo START_PREFLIGHT_CHECK_OK
+    exit /b 0
+)
+
+REM Check for uv; fall back to pip when it is unavailable.
+echo [1/9] Checking package manager...
 where uv >nul 2>&1
 if errorlevel 1 (
-    echo [信息] uv 未安装，将使用传统 pip 方式
-    echo [提示] 安装 uv 可提升速度：pip install uv
+    echo [INFO] uv was not found; pip will be used.
+    echo [TIP] Install uv for faster setup: pip install uv
     set USE_UV=0
 ) else (
-    echo [成功] 检测到 uv 包管理器
+    echo [OK] uv package manager detected.
     set USE_UV=1
 )
 echo.
 
-REM 确保 Python 版本正确
-echo [2/6] 配置 Python 版本...
+REM Ensure a compatible Python version is configured.
+echo [2/9] Configuring Python version...
 if exist .python-version (
     set /p PYTHON_VERSION=<.python-version
-    echo [信息] 当前配置版本: !PYTHON_VERSION!
+    echo [INFO] Configured version: !PYTHON_VERSION!
     
-    REM 检查是否为 3.10（不兼容）
+    REM Python 3.10 is not supported by this project.
     echo !PYTHON_VERSION! | findstr /C:"3.10" >nul
     if not errorlevel 1 (
-        echo [警告] Python 3.10 不兼容，自动更新到 3.13...
+        echo [WARN] Python 3.10 is unsupported; changing configuration to 3.13...
         echo 3.13> .python-version
-        echo [成功] 已更新到 Python 3.13
+        echo [OK] Python configuration updated to 3.13.
     )
 ) else (
-    echo [信息] 创建 .python-version 文件...
+    echo [INFO] Creating .python-version...
     echo 3.13> .python-version
 )
 echo.
 
-REM 创建或同步虚拟环境
-echo [3/6] 创建/同步虚拟环境...
+REM Create or synchronize the virtual environment.
+echo [3/9] Preparing virtual environment...
 if exist .venv\Scripts\python.exe (
-    echo [信息] 虚拟环境已存在，检查更新...
+    echo [INFO] Existing virtual environment found; checking dependencies...
     
-    REM 如果有 uv，尝试使用 uv sync
+    REM Prefer uv sync when uv is available.
     if "%USE_UV%"=="1" (
         uv sync 2>nul
         if errorlevel 1 (
-            echo [警告] uv sync 失败，使用 pip 更新...
+            echo [WARN] uv sync failed; updating with pip...
             .venv\Scripts\python.exe -m pip install -e . -q
         ) else (
-            echo [成功] 使用 uv 同步完成
+            echo [OK] Dependencies synchronized with uv.
         )
     ) else (
-        echo [信息] 使用 pip 更新依赖...
+        echo [INFO] Updating dependencies with pip...
         .venv\Scripts\python.exe -m pip install -e . -q
     )
 ) else (
-    echo [信息] 创建新的虚拟环境...
+    echo [INFO] Creating a new virtual environment...
     
-    REM 如果有 uv，尝试使用 uv sync
+    REM Prefer uv sync when uv is available.
     if "%USE_UV%"=="1" (
-        echo [信息] 尝试使用 uv sync 创建...
+        echo [INFO] Trying uv sync...
         uv sync 2>nul
         if not errorlevel 1 (
-            echo [成功] 使用 uv 创建完成
+            echo [OK] Virtual environment created with uv.
             goto :venv_created
         )
-        echo [警告] uv sync 失败，回退到传统方式...
+        echo [WARN] uv sync failed; falling back to Python venv...
     )
     
-    REM 使用传统 Python venv 创建
-    echo [信息] 使用 python -m venv 创建...
+    REM Create the environment with the standard venv module.
+    echo [INFO] Running python -m venv...
     python -m venv .venv
     if errorlevel 1 (
-        echo [错误] 虚拟环境创建失败
-        echo [提示] 请确保已安装 Python 3.11+
+        echo [ERROR] Failed to create the virtual environment.
+        echo [TIP] Make sure Python 3.11 or newer is installed.
         pause
         exit /b 1
     )
     
-    REM 安装依赖
-    echo [信息] 安装项目依赖（这可能需要几分钟）...
+    REM Install project dependencies.
+    echo [INFO] Installing project dependencies; this may take a few minutes...
     .venv\Scripts\python.exe -m pip install --upgrade pip -q
     .venv\Scripts\python.exe -m pip install -e . -q
     if errorlevel 1 (
-        echo [错误] 依赖安装失败
+        echo [ERROR] Dependency installation failed.
         pause
         exit /b 1
     )
-    echo [成功] 虚拟环境创建完成
+    echo [OK] Virtual environment created.
 )
 
 :venv_created
-echo [成功] 虚拟环境就绪
+echo [OK] Virtual environment is ready.
 echo.
 
-REM 设置 Python 命令
+REM Configure the project Python executable.
 set PYTHON_CMD=.venv\Scripts\python.exe
 
-REM 启动 Docker Compose。up -d 是幂等操作，会保留未变化的已有容器并补齐新增服务。
-echo [4/8] 启动 Milvus 和 Prometheus 基础设施...
-docker compose -f vector-database.yml up -d
+REM Reuse fixed-name Milvus containers from an older Compose project when present.
+REM This avoids container_name conflicts; the current project starts only Prometheus.
+echo [4/9] Starting Milvus and Prometheus infrastructure...
+set MILVUS_STACK_EXISTS=1
+for %%c in (milvus-etcd milvus-minio milvus-standalone milvus-attu) do (
+    docker container inspect %%c >nul 2>&1
+    if errorlevel 1 set MILVUS_STACK_EXISTS=0
+)
+
+if "!MILVUS_STACK_EXISTS!"=="1" (
+    echo [INFO] Existing Milvus containers detected; reusing them...
+    docker start milvus-etcd milvus-minio milvus-standalone milvus-attu >nul
+    if errorlevel 1 (
+        echo [ERROR] Failed to start the existing Milvus containers.
+        pause
+        exit /b 1
+    )
+    echo [INFO] Starting only Prometheus with the current Compose project...
+    docker compose -f vector-database.yml up -d prometheus
+) else (
+    echo [INFO] No complete existing Milvus stack found; creating the infrastructure with Compose...
+    docker compose -f vector-database.yml up -d
+)
 if errorlevel 1 (
-    echo [错误] Docker 启动失败，请确保 Docker Desktop 和镜像网络可用
+    echo [ERROR] Docker startup failed. Check Docker Desktop and image network access.
     pause
     exit /b 1
 )
-echo [信息] 等待基础设施启动（10秒）...
+echo [INFO] Waiting 10 seconds for the infrastructure...
 timeout /t 10 /nobreak >nul
-echo [成功] Milvus 和 Prometheus 基础设施已启动
+echo [OK] Milvus and Prometheus infrastructure started.
 echo.
 
-REM 启动 CLS MCP 服务
-echo [5/8] 启动 CLS MCP 服务...
+REM Start the grid data collection and synchronization simulator.
+echo [5/9] Starting grid service simulator...
+start "Grid Service Simulator" /min %PYTHON_CMD% -m uvicorn grid_simulator.service:app --host 0.0.0.0 --port 9105
+timeout /t 3 /nobreak >nul
+curl -s -f http://localhost:9105/health >nul 2>&1
+if errorlevel 1 (
+    echo [WARN] Grid simulator is not ready yet; check its process window.
+) else (
+    echo [OK] Grid simulator started.
+)
+echo.
+
+REM Start the CLS MCP server.
+echo [6/9] Starting CLS MCP server...
 start "CLS MCP Server" /min %PYTHON_CMD% mcp_servers/cls_server.py
 timeout /t 2 /nobreak >nul
-echo [成功] CLS MCP 服务已启动
+echo [OK] CLS MCP server started.
 echo.
 
-REM 启动 Monitor MCP 服务
-echo [6/8] 启动 Monitor MCP 服务...
+REM Start the Monitor MCP server.
+echo [7/9] Starting Monitor MCP server...
 start "Monitor MCP Server" /min %PYTHON_CMD% mcp_servers/monitor_server.py
 timeout /t 2 /nobreak >nul
-echo [成功] Monitor MCP 服务已启动
+echo [OK] Monitor MCP server started.
 echo.
 
-REM 启动 FastAPI 服务
-echo [7/8] 启动 FastAPI 服务...
+REM Start the FastAPI server.
+echo [8/9] Starting FastAPI server...
 start "SuperBizAgent API" %PYTHON_CMD% -m uvicorn app.main:app --host 0.0.0.0 --port 9900
-echo [信息] 等待服务启动（15秒）...
+echo [INFO] Waiting 15 seconds for the API...
 timeout /t 15 /nobreak >nul
 echo.
 
-REM 检查服务状态并上传文档
+REM Check API status and upload runbooks.
 echo.
-echo [信息] 检查服务状态...
+echo [INFO] Checking API status...
 curl -s http://localhost:9900/health >nul 2>&1
 if errorlevel 1 (
-    echo [警告] 服务可能还未完全启动，请稍等片刻
+    echo [WARN] The API may still be starting. Wait a little longer and check the process window.
 ) else (
-    echo [成功] FastAPI 服务运行正常
+    echo [OK] FastAPI server is healthy.
     echo.
     
-    REM 调用 API 上传 aiops-docs 文档到向量数据库
-    echo [8/8] 上传文档到向量数据库...
+    REM Upload aiops-docs files through the API.
+    echo [9/9] Uploading runbooks to the vector database...
     for %%f in (aiops-docs\*.md) do (
-        echo   上传: %%~nxf
+        echo   Uploading: %%~nxf
         curl -s -X POST http://localhost:9900/api/upload -F "file=@%%f" >nul 2>&1
     )
-    echo [成功] 文档上传完成
+    echo [OK] Runbook upload completed.
 )
 
 echo.
 echo ====================================
-echo 服务启动完成！
+echo Service startup completed.
 echo ====================================
-echo Web 界面: http://localhost:9900
-echo API 文档: http://localhost:9900/docs
+echo Web UI: http://localhost:9900
+echo API docs: http://localhost:9900/docs
+echo Grid simulator: http://localhost:9105
+echo Grid control: http://localhost:9105/control
+echo Scenario status: http://localhost:9105/api/status
 echo Prometheus: http://localhost:9090
 echo Prometheus Targets: http://localhost:9090/targets
 echo.
-echo 查看日志:
-echo   - FastAPI: logs\app_*.log（Loguru 日志，按天轮转）
+echo Logs:
+echo   - FastAPI: logs\app_*.log
 echo   - CLS MCP: type mcp_cls.log
 echo   - Monitor: type mcp_monitor.log
-echo 停止服务: stop-windows.bat
+echo Stop services: stop-windows.bat
 echo ====================================
 pause

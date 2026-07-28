@@ -9,8 +9,15 @@ from loguru import logger
 
 from app.models.aiops import AIOpsRequest
 from app.services.aiops_service import aiops_service
+from app.services.rag_agent_service import rag_agent_service
 
 router = APIRouter()
+
+
+@router.get("/aiops/alert-status")
+async def get_alert_status():
+    """返回当前 Prometheus 活动告警摘要，不调用大模型。"""
+    return await aiops_service.get_alert_status()
 
 
 @router.post("/aiops")
@@ -125,8 +132,27 @@ async def diagnose_stream(request: AIOpsRequest):
     logger.info(f"[会话 {session_id}] 收到 AIOps 诊断请求（流式）")
 
     async def event_generator():
+        context_recorded = False
         try:
             async for event in aiops_service.diagnose(session_id=session_id):
+                report = event.get("report") or event.get("response") or ""
+                diagnosis = event.get("diagnosis")
+                if not report and isinstance(diagnosis, dict):
+                    report = diagnosis.get("report", "")
+
+                if report and not context_recorded:
+                    try:
+                        await rag_agent_service.record_aiops_report(session_id, report)
+                        context_recorded = True
+                    except Exception as context_error:
+                        # 上下文交接失败不应吞掉已经生成的诊断报告；如果后续还有
+                        # complete 事件，会再尝试一次。
+                        logger.error(
+                            f"[会话 {session_id}] AIOps 报告上下文交接失败: "
+                            f"{context_error}",
+                            exc_info=True,
+                        )
+
                 # 发送事件
                 yield {
                     "event": "message",

@@ -1,6 +1,7 @@
 global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+  # 演示环境使用较短周期，让故障注入后可以快速观察 pending/firing 状态。
+  scrape_interval: 5s
+  evaluation_interval: 5s
   external_labels:
     environment: local-demo
 
@@ -16,13 +17,16 @@ scrape_configs:
           system: oncall
           service: prometheus
 
-  # Windows 开发环境使用 windows_exporter 暴露主机指标。
-  # 安装后应监听 9182 端口；Docker Desktop 通过 host.docker.internal 访问宿主机。
-  - job_name: windows-exporter
+  # 电网数据采集与同步模拟服务运行在宿主机 9105 端口。
+  # Docker Desktop / Linux host-gateway 均通过 host.docker.internal 访问。
+  - job_name: grid-service-simulator
+    metrics_path: /metrics
+    honor_labels: true
     static_configs:
       - targets:
-          - host.docker.internal:9182
+          - host.docker.internal:9105
         labels:
-          system: oncall-demo
-          service: data-sync-service
-          station: local-demo
+          system: grid-oncall-demo
+          region: demo-grid-region
+          station: demo-control-center
+          service: grid-data-sync-service

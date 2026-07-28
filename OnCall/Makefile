@@ -9,6 +9,7 @@ UPLOAD_API = $(SERVER_URL)/api/upload
 HEALTH_CHECK_API = $(SERVER_URL)/health
 DOCS_DIR = aiops-docs
 MILVUS_CONTAINER = milvus-standalone
+MILVUS_CONTAINERS = milvus-etcd milvus-minio milvus-standalone milvus-attu
 
 # 颜色输出
 GREEN = \033[0;32m
@@ -21,7 +22,8 @@ NC = \033[0m
         install install-dev dev run test test-quick format lint fix type-check \
         security pre-commit-install pre-commit check-all coverage docs shell \
         ipython watch add add-dev remove list-docs test-upload sync logs \
-        start-cls stop-cls start-monitor stop-monitor start-api stop-api status-mcp
+        start-grid-simulator stop-grid-simulator start-cls stop-cls \
+        start-monitor stop-monitor start-api stop-api status-mcp
 
 # ============================================================
 # 默认目标：显示帮助信息
@@ -47,6 +49,8 @@ help:
 	@echo "  $(YELLOW)make status-mcp$(NC)   - 📊 查看 MCP 服务状态"
 	@echo ""
 	@echo "$(CYAN)【MCP 服务管理】$(NC)"
+	@echo "  $(YELLOW)make start-grid-simulator$(NC) - ⚡ 启动电网业务模拟服务"
+	@echo "  $(YELLOW)make stop-grid-simulator$(NC)  - 🛑 停止电网业务模拟服务"
 	@echo "  $(YELLOW)make start-cls$(NC)     - 📋 启动 CLS MCP 服务"
 	@echo "  $(YELLOW)make stop-cls$(NC)      - 🛑 停止 CLS MCP 服务"
 	@echo "  $(YELLOW)make start-monitor$(NC) - 📊 启动 Monitor MCP 服务"
@@ -137,13 +141,25 @@ up:
 		sleep 3; \
 	fi
 	@echo "$(YELLOW)🚀 启动 Milvus 和 Prometheus 基础设施...$(NC)"
-	@docker compose -f vector-database.yml up -d
+	@legacy_stack=true; \
+	for container in $(MILVUS_CONTAINERS); do \
+		docker container inspect $$container > /dev/null 2>&1 || legacy_stack=false; \
+	done; \
+	if [ "$$legacy_stack" = "true" ]; then \
+		echo "$(YELLOW)检测到既有 Milvus 固定容器，直接复用并仅由当前 Compose 启动 Prometheus$(NC)"; \
+		docker start $(MILVUS_CONTAINERS) > /dev/null; \
+		docker compose -f vector-database.yml up -d prometheus; \
+	else \
+		echo "$(YELLOW)未检测到完整的既有 Milvus 容器组，使用当前 Compose 创建基础设施$(NC)"; \
+		docker compose -f vector-database.yml up -d; \
+	fi
 	@echo "$(YELLOW)⏳ 等待容器启动...$(NC)"
 	@sleep 5
 	@if docker ps --format '{{.Names}}' | grep -q "^$(MILVUS_CONTAINER)$$"; then \
 		echo "$(GREEN)✅ Docker 基础设施启动成功！$(NC)"; \
 		echo ""; \
 		docker compose -f vector-database.yml ps; \
+		docker ps --filter "name=milvus-" --format "table {{.Names}}\t{{.Status}}"; \
 		echo ""; \
 		echo "$(GREEN)🌐 服务访问地址:$(NC)"; \
 		echo "   Milvus: localhost:19530"; \
@@ -179,6 +195,36 @@ status:
 # ============================================================
 # MCP 服务管理
 # ============================================================
+
+# 启动电网数据采集与同步模拟服务
+start-grid-simulator:
+	@echo "$(YELLOW)⚡ 启动电网数据采集与同步模拟服务...$(NC)"
+	@if pgrep -f "uvicorn grid_simulator.service:app" > /dev/null 2>&1; then \
+		echo "$(GREEN)✅ 电网模拟服务已经在运行中$(NC)"; \
+	else \
+		nohup .venv/bin/python -m uvicorn grid_simulator.service:app --host 0.0.0.0 --port 9105 > grid_simulator.log 2>&1 & \
+		echo $$! > grid_simulator.pid; \
+		sleep 2; \
+		if curl -s -f http://127.0.0.1:9105/health > /dev/null 2>&1; then \
+			echo "$(GREEN)✅ 电网模拟服务启动成功$(NC)"; \
+			echo "$(YELLOW)   URL: http://127.0.0.1:9105$(NC)"; \
+		else \
+			echo "$(RED)❌ 电网模拟服务启动失败，请检查 grid_simulator.log$(NC)"; \
+		fi; \
+	fi
+
+# 停止电网数据采集与同步模拟服务
+stop-grid-simulator:
+	@echo "$(YELLOW)🛑 停止电网模拟服务...$(NC)"
+	@if [ -f grid_simulator.pid ]; then \
+		pid=$$(cat grid_simulator.pid); \
+		if ps -p $$pid > /dev/null 2>&1; then kill $$pid; fi; \
+		rm -f grid_simulator.pid; \
+		echo "$(GREEN)✅ 电网模拟服务已停止$(NC)"; \
+	else \
+		pkill -f "uvicorn grid_simulator.service:app" 2>/dev/null || true; \
+		echo "$(YELLOW)⚠️  未找到运行中的电网模拟服务$(NC)"; \
+	fi
 
 # 启动 CLS MCP 服务
 start-cls:
@@ -245,6 +291,14 @@ stop-monitor:
 status-mcp:
 	@echo "$(YELLOW)📊 MCP 服务状态:$(NC)"
 	@echo ""
+	@echo "$(CYAN)电网模拟服务:$(NC)"
+	@if curl -s -f http://127.0.0.1:9105/health > /dev/null 2>&1; then \
+		echo "  状态: $(GREEN)运行中$(NC)"; \
+		echo "  URL: http://127.0.0.1:9105"; \
+	else \
+		echo "  状态: $(RED)未运行或处于 service_down 场景$(NC)"; \
+	fi
+	@echo ""
 	@echo "$(CYAN)CLS MCP 服务:$(NC)"
 	@if pgrep -f "mcp_servers/cls_server.py" > /dev/null 2>&1; then \
 		pid=$$(pgrep -f "mcp_servers/cls_server.py"); \
@@ -284,6 +338,9 @@ start:
 	@echo "$(GREEN)🚀 启动所有服务$(NC)"
 	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
 	@echo ""
+	@$(MAKE) start-grid-simulator
+	@sleep 1
+	@echo ""
 	@$(MAKE) start-cls
 	@sleep 1
 	@echo ""
@@ -322,6 +379,8 @@ stop:
 	@$(MAKE) stop-cls
 	@echo ""
 	@$(MAKE) stop-monitor
+	@echo ""
+	@$(MAKE) stop-grid-simulator
 	@echo ""
 	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
 	@echo "$(GREEN)✅ 所有服务已停止！$(NC)"

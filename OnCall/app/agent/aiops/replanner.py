@@ -126,6 +126,21 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
     logger.info(f"剩余计划步骤: {len(plan)}")
     logger.info(f"已执行步骤: {len(past_steps)}")
 
+    # 有活动告警时，至少完成业务指标、日志主题、日志和知识手册四项步骤后才允许
+    # 生成报告，防止模型只拿到部分证据时提前结束。
+    prefetched_alert_total = 0
+    marker = "PREFETCHED_ACTIVE_ALERTS_TOTAL="
+    if marker in input_text:
+        try:
+            prefetched_alert_total = int(input_text.split(marker, 1)[1].splitlines()[0].strip())
+        except (ValueError, IndexError):
+            prefetched_alert_total = 0
+    if prefetched_alert_total > 0 and len(past_steps) < 4 and plan:
+        logger.info(
+            "存在预取活动告警且证据步骤不足 4 项，跳过 LLM 提前结束判断并继续执行"
+        )
+        return {}
+
     # ⚠️ 强制限制：如果已执行步骤过多，直接生成响应
     MAX_STEPS = 8
     if len(past_steps) >= MAX_STEPS:

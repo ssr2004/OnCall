@@ -14,7 +14,11 @@ from app.config import config
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS, retrieve_knowledge
 from app.agent.mcp_client import get_mcp_client_with_retry
 from .state import PlanExecuteState
-from .utils import format_tools_description
+from .utils import (
+    format_tools_description,
+    normalize_plan_steps,
+    plan_covers_active_alert_diagnosis,
+)
 
 
 class Plan(BaseModel):
@@ -22,6 +26,45 @@ class Plan(BaseModel):
     steps: List[str] = Field(
         description="完成任务所需的不同步骤。这些步骤应该按顺序执行，每一步都建立在前一步的基础上。"
     )
+
+
+def _prefetched_alert_total(input_text: str) -> int:
+    marker = "PREFETCHED_ACTIVE_ALERTS_TOTAL="
+    if marker not in input_text:
+        return 0
+    try:
+        return int(input_text.split(marker, 1)[1].splitlines()[0].strip())
+    except (ValueError, IndexError):
+        return 0
+
+
+def _standard_active_alert_plan() -> List[str]:
+    """模型计划结构异常时使用的稳定电网告警诊断计划。"""
+    return [
+        "确认 PREFETCHED_ACTIVE_ALERTS_JSON 中的活动告警、受影响服务与触发时间",
+        "根据告警类型使用 query_grid_service_status、query_grid_data_sync_metrics 或 query_grid_telemetry_metrics 查询同一服务在告警时间窗口内的业务指标",
+        "使用 search_topic_by_service_name 获取受影响服务的日志主题",
+        "使用 search_log 查询告警时间窗口内的 WARN/ERROR 业务日志",
+        "使用 retrieve_knowledge 检索告警对应的知识库处置手册",
+        "综合预取告警、业务指标、业务日志和处置手册生成诊断报告",
+    ]
+
+
+def _standard_no_alert_plan() -> List[str]:
+    return [
+        "确认 PREFETCHED_ACTIVE_ALERTS_JSON 中当前没有活动告警",
+        "基于 Prometheus 当前状态生成无活动告警的诊断报告",
+    ]
+
+
+def _ensure_plan_coverage(input_text: str, plan_steps: List[str]) -> List[str]:
+    """活动告警计划不完整时返回稳定的标准诊断计划。"""
+    if (
+        _prefetched_alert_total(input_text) > 0
+        and not plan_covers_active_alert_diagnosis(plan_steps)
+    ):
+        return _standard_active_alert_plan()
+    return plan_steps
 
 
 # Planner 提示词
@@ -47,16 +90,24 @@ planner_prompt = ChatPromptTemplate.from_messages(
                 - 步骤描述要具体、可操作
                 - **如果有相关经验文档，请参考其中的方法和步骤制定计划**
                 - 查询监控告警时，优先使用 Monitor MCP 的 list_active_alerts 工具
-                - 查询 CPU、内存趋势时，分别使用 query_cpu_metrics、query_memory_metrics 工具
+                - 查询服务健康和站点在线情况时，使用 query_grid_service_status 工具
+                - 查询队列积压和同步失败率时，使用 query_grid_data_sync_metrics 工具
+                - 查询数据新鲜度和处理延迟时，使用 query_grid_telemetry_metrics 工具
                 - 不要自行编写 PromQL；PromQL 由 Monitor MCP 内部管理
                 - 先通过告警确定受影响服务，再使用同一 service_name 查询对应指标
+                - 日志、指标和知识文档必须围绕同一告警及同一时间范围，禁止编造证据
+                - 如果输入包含 PREFETCHED_ACTIVE_ALERTS_JSON，它是已经无过滤查询得到的权威告警数据，不要再规划 list_active_alerts 步骤
+                - PREFETCHED_ACTIVE_ALERTS_TOTAL 大于 0 时，计划必须分别包含业务指标、日志和知识手册查询，不能直接生成报告
+                - search_log 依赖日志 topic_id，因此 search_topic_by_service_name 和 search_log 必须拆成前后两个步骤
+                - 每个步骤只放置同一依赖层级的工具调用，保证 Executor 能获得前序结果后再执行下一步
 
-                示例输入："分析当前系统的性能问题"
+                示例输入："诊断当前电网数据采集与同步服务是否存在告警"
                 示例输出（假设有对应工具）：
                 步骤1: 使用 list_active_alerts 查询当前活动告警并确定受影响服务
-                步骤2: 使用 query_cpu_metrics 和 query_memory_metrics 查询该服务的资源趋势
-                步骤3: 使用日志工具检查告警时间窗口内的错误日志
-                步骤4: 综合告警、指标、日志和经验文档生成性能分析报告
+                步骤2: 根据告警类型使用对应的 grid 业务指标工具查询异常趋势
+                步骤3: 使用日志工具检查告警时间窗口内的业务错误日志
+                步骤4: 使用 retrieve_knowledge 检索该告警对应的处置手册
+                步骤5: 综合告警、业务指标、日志和处置手册生成诊断报告
             """).strip(),
         ),
         ("placeholder", "{messages}"),
@@ -145,6 +196,15 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
             # 如果返回的是字典，提取 steps 字段
             plan_steps = plan_result.get("steps", [])  # type: ignore
 
+        plan_steps = normalize_plan_steps(plan_steps)
+
+        validated_plan_steps = _ensure_plan_coverage(input_text, plan_steps)
+        if validated_plan_steps != plan_steps:
+            logger.warning(
+                "模型计划未覆盖完整活动告警证据链，使用标准 6 步诊断计划"
+            )
+            plan_steps = validated_plan_steps
+
         logger.info(f"计划已生成，共 {len(plan_steps)} 个步骤")
         for i, step in enumerate(plan_steps, 1):
             logger.info(f"  步骤{i}: {step}")
@@ -153,11 +213,9 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"生成计划失败: {e}", exc_info=True)
-        # 返回一个默认计划
-        return {
-            "plan": [
-                "使用 list_active_alerts 查询当前活动告警并确定受影响服务",
-                "使用 query_cpu_metrics 和 query_memory_metrics 查询受影响服务的资源趋势",
-                "结合日志、指标和经验文档分析根因并生成报告",
-            ]
-        }
+        fallback_plan = (
+            _standard_active_alert_plan()
+            if _prefetched_alert_total(input_text) > 0
+            else _standard_no_alert_plan()
+        )
+        return {"plan": fallback_plan}

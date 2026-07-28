@@ -1,5 +1,8 @@
 # 服务不可用告警处理方案
 
+> 兼容性说明：当前电网演示的服务不可用告警为 `GridDataSyncServiceDown`，请优先使用
+> `grid_service_down.md` 及其中列出的 Monitor/CLS MCP 工具。
+
 ## 告警名称
 - **告警名**: `ServiceUnavailable`
 - **告警级别**: 紧急

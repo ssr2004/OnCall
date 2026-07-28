@@ -1,41 +1,65 @@
 groups:
-  - name: oncall-host-alerts
+  - name: grid-service-alerts
     rules:
-      - alert: MonitorTargetDown
-        expr: up{job="windows-exporter"} == 0
-        for: 1m
+      - alert: GridDataSyncServiceDown
+        expr: up{job="grid-service-simulator"} == 0
+        for: 15s
         labels:
           severity: critical
+          category: availability
         annotations:
-          summary: "监控目标不可用"
-          description: "windows_exporter 目标 {{ $labels.instance }} 已连续 1 分钟无法抓取。"
+          summary: "电网数据同步服务不可用"
+          description: "服务 {{ $labels.service }} 的指标端点已连续 15 秒无法抓取。"
 
-      - alert: HighCPUUsage
+      - alert: GridCommunicationInterrupted
         expr: |
-          100 - (
-            avg by (instance, job, service, system, station) (
-              rate(windows_cpu_time_total{mode="idle"}[5m])
-            ) * 100
-          ) > 80
-        for: 2m
+          grid_station_online{job="grid-service-simulator"}
+          <
+          grid_station_total{job="grid-service-simulator"}
+        for: 15s
+        labels:
+          severity: critical
+          category: communication
+        annotations:
+          summary: "部分电网站点通信中断"
+          description: "服务 {{ $labels.service }} 检测到在线站点数量低于应接入站点总数。"
+
+      - alert: GridTelemetryQueueBacklog
+        expr: grid_telemetry_queue_depth{job="grid-service-simulator"} > 1000
+        for: 15s
         labels:
           severity: warning
+          category: processing
         annotations:
-          summary: "CPU 使用率持续过高"
-          description: "目标 {{ $labels.instance }} 的 CPU 使用率已连续 2 分钟超过 80%。"
+          summary: "电网遥测消息严重积压"
+          description: "服务 {{ $labels.service }} 的待处理遥测消息已连续 15 秒超过 1000 条。"
 
-      - alert: HighMemoryUsage
-        expr: |
-          (
-            1 - (
-              windows_os_physical_memory_free_bytes
-              /
-              windows_cs_physical_memory_bytes
-            )
-          ) * 100 > 70
-        for: 2m
+      - alert: GridDataSyncFailureRateHigh
+        expr: grid_data_sync_failure_rate{job="grid-service-simulator"} > 20
+        for: 15s
+        labels:
+          severity: critical
+          category: data-sync
+        annotations:
+          summary: "电网数据同步失败率过高"
+          description: "服务 {{ $labels.service }} 的数据同步失败率已连续 15 秒超过 20%。"
+
+      - alert: GridDataFreshnessDelayHigh
+        expr: grid_data_freshness_seconds{job="grid-service-simulator"} > 30
+        for: 15s
         labels:
           severity: warning
+          category: data-quality
         annotations:
-          summary: "内存使用率持续过高"
-          description: "目标 {{ $labels.instance }} 的内存使用率已连续 2 分钟超过 70%。"
+          summary: "电网遥测数据更新延迟"
+          description: "服务 {{ $labels.service }} 的最新遥测数据已连续 15 秒超过 30 秒未更新。"
+
+      - alert: GridTelemetryProcessingLatencyHigh
+        expr: grid_telemetry_processing_latency_seconds{job="grid-service-simulator"} > 2
+        for: 15s
+        labels:
+          severity: warning
+          category: processing
+        annotations:
+          summary: "电网遥测处理延迟过高"
+          description: "服务 {{ $labels.service }} 的遥测处理耗时已连续 15 秒超过 2 秒。"
