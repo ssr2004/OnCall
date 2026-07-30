@@ -40,7 +40,12 @@ class Settings(BaseSettings):
     aiops_report_model: str = "qwen3.7-max-2026-06-08"
 
     chat_model_max_output_tokens: int = 4096
-    chat_summary_max_output_tokens: int = 2048
+    # 摘要上限按待压缩历史动态计算：默认取 5%，限制在 8K～32K。
+    chat_summary_min_output_tokens: int = 8192
+    chat_summary_max_output_tokens: int = 32768
+    chat_summary_output_ratio: float = 0.05
+    chat_summary_model_context_window_tokens: int = 1_000_000
+    chat_summary_model_max_input_tokens: int = 991_808
     aiops_planner_max_output_tokens: int = 2048
     aiops_executor_max_output_tokens: int = 2048
     aiops_replanner_max_output_tokens: int = 1024
@@ -81,6 +86,10 @@ class Settings(BaseSettings):
     chat_model_max_input_tokens: int = 991_808
     # 256K 是该模型当前最低输入价格档的上界，用作成本与延迟软上限。
     chat_context_operating_input_tokens: int = 256_000
+    # 成本档压缩后允许继续使用长上下文；达到有效输入上限的 80% 时执行安全压缩。
+    chat_context_safety_ratio: float = 0.80
+    # 每次压缩都以完整 HumanMessage 轮次为边界，保留当时最新 8 轮。
+    chat_context_keep_turns: int = 8
     # 以下固定阈值仅为旧环境变量兼容项；运行时使用模型规格动态计算。
     chat_tool_prune_trigger_tokens: int = 18000
     chat_context_compaction_trigger_tokens: int = 24000

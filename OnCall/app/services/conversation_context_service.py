@@ -2,21 +2,132 @@
 
 from __future__ import annotations
 
+import json
+import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from dashscope.tokenizers import get_tokenizer
 from langchain.agents.middleware import AgentMiddleware, SummarizationMiddleware
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+    convert_to_openai_messages,
+    get_buffer_string,
+)
 from langchain_core.messages.utils import count_tokens_approximately
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 
 TokenCounter = Callable[[Iterable[Any]], int]
+TextTokenCounter = Callable[[str], int]
 
 
 def count_qwen_tokens_conservatively(messages: Iterable[Any]) -> int:
     """保守估算中英文混合 Qwen 消息 Token，避免按英文 chars/4 低估中文。"""
     return count_tokens_approximately(messages, chars_per_token=2.0)
+
+
+class QwenChatTokenCounter:
+    """使用 DashScope 随包提供的 Qwen Tokenizer 计算完整聊天请求。
+
+    计数覆盖 System Prompt、工具 Schema、历史消息、工具调用和工具结果。
+    ChatML 标记与 OpenAI 兼容工具协议也会进入计数，因此可以直接使用
+    完整请求阈值，而不需要再从阈值中人工扣除固定提示词开销。
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        system_prompt: str,
+        tools: Sequence[Any],
+    ) -> None:
+        self._tokenizer = get_tokenizer(model_name)
+        self._system_prompt = system_prompt
+        self._tool_schemas = [convert_to_openai_tool(tool) for tool in tools]
+
+    @staticmethod
+    def _json(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _count_text(self, text: str) -> int:
+        return len(self._tokenizer.encode(text))
+
+    def count_text(self, text: str) -> int:
+        """计算普通文本的 Qwen Token 数。"""
+        return self._count_text(text)
+
+    def _count_chat_message(self, message: dict[str, Any]) -> int:
+        role = str(message.get("role", "user"))
+        body = {key: value for key, value in message.items() if key != "role"}
+        # Qwen 对话采用 ChatML 边界；复杂内容和 tool_calls 按实际 JSON 形态计数。
+        return (
+            self._count_text("<|im_start|>")
+            + self._count_text(role)
+            + self._count_text("\n")
+            + self._count_text(self._json(body))
+            + self._count_text("<|im_end|>\n")
+        )
+
+    def __call__(self, messages: Iterable[Any]) -> int:
+        materialized = list(messages)
+        openai_messages: list[dict[str, Any]] = []
+        if self._system_prompt:
+            openai_messages.append(
+                {"role": "system", "content": self._system_prompt}
+            )
+        if materialized:
+            converted = convert_to_openai_messages(materialized)
+            if isinstance(converted, dict):
+                openai_messages.append(converted)
+            else:
+                openai_messages.extend(converted)
+
+        total = sum(self._count_chat_message(message) for message in openai_messages)
+        if self._tool_schemas:
+            total += self._count_text(self._json({"tools": self._tool_schemas}))
+        # 为即将生成的 assistant 消息预留 ChatML 起始标记。
+        total += self._count_text("<|im_start|>assistant\n")
+        return total
+
+    def count_messages_only(self, messages: Iterable[Any]) -> int:
+        """仅计算给定历史消息，不包含 System Prompt 和工具 Schema。"""
+        materialized = list(messages)
+        if not materialized:
+            return 0
+        converted = convert_to_openai_messages(materialized)
+        openai_messages = [converted] if isinstance(converted, dict) else converted
+        return sum(self._count_chat_message(message) for message in openai_messages)
+
+
+def calculate_dynamic_summary_output_tokens(
+    tokens_to_summarize: int,
+    *,
+    minimum_tokens: int,
+    maximum_tokens: int,
+    output_ratio: float,
+) -> int:
+    """根据实际待摘要历史长度计算本次摘要输出上限。"""
+    if tokens_to_summarize < 0:
+        raise ValueError("待摘要 Token 数不能为负数")
+    if minimum_tokens <= 0 or maximum_tokens < minimum_tokens:
+        raise ValueError("摘要输出范围配置无效")
+    if not 0 < output_ratio <= 1:
+        raise ValueError("摘要输出比例必须在 0 和 1 之间")
+    proportional_tokens = math.ceil(tokens_to_summarize * output_ratio)
+    return min(maximum_tokens, max(minimum_tokens, proportional_tokens))
 
 
 def estimate_fixed_prompt_tokens(
@@ -40,6 +151,9 @@ class ConversationContextBudget:
     fixed_prompt_tokens: int
     message_trigger_tokens: int
     keep_recent_tokens: int
+    cost_trigger_tokens: int
+    safety_trigger_tokens: int
+    keep_recent_turns: int
 
 
 def build_conversation_context_budget(
@@ -49,12 +163,18 @@ def build_conversation_context_budget(
     max_output_tokens: int,
     operating_input_tokens: int,
     fixed_prompt_tokens: int,
+    safety_ratio: float = 0.8,
+    keep_recent_turns: int = 8,
 ) -> ConversationContextBudget:
-    """计算可供消息历史使用的预算，不再依赖固定 18K/24K 阈值。"""
+    """计算 256K 成本档、80% 安全档和模型硬上限。"""
     if min(context_window_tokens, max_input_tokens, max_output_tokens) <= 0:
         raise ValueError("模型上下文、最大输入和最大输出必须为正整数")
     if max_output_tokens >= context_window_tokens:
         raise ValueError("模型最大输出必须小于上下文窗口")
+    if not 0 < safety_ratio < 1:
+        raise ValueError("安全档比例必须在 0 和 1 之间")
+    if keep_recent_turns <= 0:
+        raise ValueError("最近完整轮次数必须为正整数")
 
     hard_input_tokens = min(
         max_input_tokens,
@@ -66,6 +186,9 @@ def build_conversation_context_budget(
             effective_input_tokens,
             operating_input_tokens,
         )
+    safety_trigger_tokens = int(hard_input_tokens * safety_ratio)
+    if safety_trigger_tokens <= effective_input_tokens:
+        raise ValueError("安全档必须高于成本档")
 
     message_trigger_tokens = effective_input_tokens - fixed_prompt_tokens
     if message_trigger_tokens <= 0:
@@ -82,6 +205,9 @@ def build_conversation_context_budget(
         fixed_prompt_tokens=fixed_prompt_tokens,
         message_trigger_tokens=message_trigger_tokens,
         keep_recent_tokens=keep_recent_tokens,
+        cost_trigger_tokens=effective_input_tokens,
+        safety_trigger_tokens=safety_trigger_tokens,
+        keep_recent_turns=keep_recent_turns,
     )
 
 CONVERSATION_SUMMARY_PROMPT = """
@@ -262,3 +388,347 @@ class SafeSummarizationMiddleware(SummarizationMiddleware):
     ) -> dict[str, Any] | None:
         result = await super().abefore_model(state, runtime)
         return None if self._summary_failed(result) else result
+
+
+class ContextWindowExceededError(RuntimeError):
+    """压缩后仍无法安全装入模型输入窗口。"""
+
+
+class TwoTierContextMiddleware(SafeSummarizationMiddleware):
+    """对话上下文的 256K 成本档与 80% 安全档压缩策略。
+
+    会话中尚无历史摘要时使用成本档；生成首份摘要后，不会在每个新增轮次
+    重复摘要，而是允许原始轮次继续积累到安全档。每次压缩都重新选择当时
+    最新的完整对话轮次，旧摘要会与滑出窗口的原始轮次一起合并。
+    """
+
+    def __init__(
+        self,
+        *,
+        model: Any,
+        cost_trigger_tokens: int,
+        safety_trigger_tokens: int,
+        hard_input_tokens: int,
+        keep_recent_turns: int,
+        max_tool_output_chars: int,
+        token_counter: TokenCounter,
+        summary_input_token_counter: TokenCounter,
+        summary_text_token_counter: TextTokenCounter,
+        summary_min_output_tokens: int,
+        summary_max_output_tokens: int,
+        summary_output_ratio: float,
+        summary_model_context_window_tokens: int,
+        summary_model_max_input_tokens: int,
+        summary_prompt: str,
+    ) -> None:
+        if not 0 < cost_trigger_tokens < safety_trigger_tokens < hard_input_tokens:
+            raise ValueError("上下文阈值必须满足 成本档 < 安全档 < 硬上限")
+        if keep_recent_turns <= 0:
+            raise ValueError("最近完整轮次数必须为正整数")
+        if max_tool_output_chars <= 0:
+            raise ValueError("工具结果裁剪长度必须为正整数")
+        calculate_dynamic_summary_output_tokens(
+            0,
+            minimum_tokens=summary_min_output_tokens,
+            maximum_tokens=summary_max_output_tokens,
+            output_ratio=summary_output_ratio,
+        )
+        if min(
+            summary_model_context_window_tokens,
+            summary_model_max_input_tokens,
+        ) <= 0:
+            raise ValueError("摘要模型上下文和最大输入必须为正整数")
+
+        super().__init__(
+            model=model,
+            trigger=None,
+            keep=("messages", 1),
+            token_counter=token_counter,
+            summary_prompt=summary_prompt,
+            trim_tokens_to_summarize=None,
+        )
+        self.cost_trigger_tokens = cost_trigger_tokens
+        self.safety_trigger_tokens = safety_trigger_tokens
+        self.hard_input_tokens = hard_input_tokens
+        self.keep_recent_turns = keep_recent_turns
+        self.max_tool_output_chars = max_tool_output_chars
+        self.summary_input_token_counter = summary_input_token_counter
+        self.summary_text_token_counter = summary_text_token_counter
+        self.summary_min_output_tokens = summary_min_output_tokens
+        self.summary_max_output_tokens = summary_max_output_tokens
+        self.summary_output_ratio = summary_output_ratio
+        self.summary_model_context_window_tokens = summary_model_context_window_tokens
+        self.summary_model_max_input_tokens = summary_model_max_input_tokens
+
+    def _summary_request(
+        self,
+        messages_to_summarize: list[BaseMessage],
+    ) -> tuple[str, int]:
+        """构造摘要请求，并按真实待摘要长度计算本次 max_tokens。"""
+        formatted_messages = get_buffer_string(messages_to_summarize)
+        prompt = self.summary_prompt.format(messages=formatted_messages).rstrip()
+        tokens_to_summarize = self.summary_input_token_counter(
+            messages_to_summarize
+        )
+        desired_output_tokens = calculate_dynamic_summary_output_tokens(
+            tokens_to_summarize,
+            minimum_tokens=self.summary_min_output_tokens,
+            maximum_tokens=self.summary_max_output_tokens,
+            output_ratio=self.summary_output_ratio,
+        )
+        summary_input_tokens = self.summary_text_token_counter(prompt)
+        if summary_input_tokens > self.summary_model_max_input_tokens:
+            raise ContextWindowExceededError(
+                "待摘要历史本身已有 "
+                f"{summary_input_tokens} Token，超过摘要模型最大输入 "
+                f"{self.summary_model_max_input_tokens}。"
+            )
+
+        available_output_tokens = (
+            self.summary_model_context_window_tokens - summary_input_tokens
+        )
+        if available_output_tokens <= 0:
+            raise ContextWindowExceededError(
+                "摘要请求输入已占满摘要模型上下文窗口，无法生成摘要。"
+            )
+        return prompt, min(desired_output_tokens, available_output_tokens)
+
+    def _create_summary(self, messages_to_summarize: list[BaseMessage]) -> str:
+        if not messages_to_summarize:
+            return "No previous conversation history."
+        try:
+            prompt, max_tokens = self._summary_request(messages_to_summarize)
+            response = self.model.bind(max_tokens=max_tokens).invoke(
+                prompt,
+                config={
+                    "metadata": {
+                        "lc_source": "summarization",
+                        "summary_max_tokens": max_tokens,
+                    }
+                },
+            )
+            return response.text.strip()
+        except ContextWindowExceededError:
+            raise
+        except Exception as exc:
+            return f"Error generating summary: {exc!s}"
+
+    async def _acreate_summary(
+        self,
+        messages_to_summarize: list[BaseMessage],
+    ) -> str:
+        if not messages_to_summarize:
+            return "No previous conversation history."
+        try:
+            prompt, max_tokens = self._summary_request(messages_to_summarize)
+            response = await self.model.bind(max_tokens=max_tokens).ainvoke(
+                prompt,
+                config={
+                    "metadata": {
+                        "lc_source": "summarization",
+                        "summary_max_tokens": max_tokens,
+                    }
+                },
+            )
+            return response.text.strip()
+        except ContextWindowExceededError:
+            raise
+        except Exception as exc:
+            return f"Error generating summary: {exc!s}"
+
+    @staticmethod
+    def _is_summary(message: BaseMessage) -> bool:
+        metadata = getattr(message, "additional_kwargs", {}) or {}
+        return metadata.get("lc_source") == "summarization"
+
+    def _has_summary(self, messages: Sequence[BaseMessage]) -> bool:
+        return any(self._is_summary(message) for message in messages)
+
+    def _recent_turn_cutoff(self, messages: Sequence[BaseMessage]) -> int:
+        """返回最新 N 个完整 Human 轮次的起点，不把历史摘要算作新轮次。"""
+        turn_starts = [
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message, HumanMessage) and not self._is_summary(message)
+        ]
+        if len(turn_starts) <= self.keep_recent_turns:
+            return 0
+        return turn_starts[-self.keep_recent_turns]
+
+    @staticmethod
+    def _current_turn_start(messages: Sequence[BaseMessage]) -> int:
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            metadata = getattr(message, "additional_kwargs", {}) or {}
+            if (
+                isinstance(message, HumanMessage)
+                and metadata.get("lc_source") != "summarization"
+            ):
+                return index
+        return len(messages)
+
+    @staticmethod
+    def _tool_result_was_consumed(
+        messages: Sequence[BaseMessage],
+        tool_index: int,
+    ) -> bool:
+        """只有结果之后已经出现 AIMessage，才说明模型消费过该工具结果。"""
+        return any(
+            isinstance(message, AIMessage)
+            for message in messages[tool_index + 1 :]
+        )
+
+    def _pruned_tool_message(self, message: ToolMessage, rendered: str) -> ToolMessage:
+        metadata = dict(message.additional_kwargs or {})
+        metadata.update(
+            {
+                "context_pruned": True,
+                "original_content_chars": len(rendered),
+            }
+        )
+        preview_budget = max(0, self.max_tool_output_chars - 320)
+        preview = rendered[:preview_budget].rstrip()
+        details = [
+            "[已消费的工具原始输出已压缩]",
+            f"tool_name={message.name or 'unknown'}",
+            f"tool_call_id={message.tool_call_id}",
+            f"original_chars={len(rendered)}",
+        ]
+        if preview:
+            details.append(f"evidence_preview={preview}")
+        details.append("完整结果仍保存在本地会话 Transcript 中。")
+        return message.model_copy(
+            update={
+                "content": "\n".join(details),
+                "additional_kwargs": metadata,
+            }
+        )
+
+    def _prune_consumed_tools(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        safety_mode: bool,
+    ) -> tuple[list[BaseMessage], bool]:
+        """成本档只裁剪保留窗口以前的结果，安全档扩展到当前轮以前。"""
+        retained_cutoff = self._recent_turn_cutoff(messages)
+        prune_before = (
+            self._current_turn_start(messages) if safety_mode else retained_cutoff
+        )
+        updated = list(messages)
+        changed = False
+        for index, message in enumerate(messages[:prune_before]):
+            if not isinstance(message, ToolMessage):
+                continue
+            if (message.additional_kwargs or {}).get("context_pruned"):
+                continue
+            if not self._tool_result_was_consumed(messages, index):
+                continue
+            content = message.content
+            rendered = content if isinstance(content, str) else self._json_content(content)
+            if len(rendered) <= self.max_tool_output_chars:
+                continue
+            updated[index] = self._pruned_tool_message(message, rendered)
+            changed = True
+        return updated, changed
+
+    @staticmethod
+    def _json_content(content: Any) -> str:
+        return json.dumps(content, ensure_ascii=False, default=str)
+
+    def _assert_below_hard_limit(self, messages: Sequence[BaseMessage]) -> None:
+        total_tokens = self.token_counter(messages)
+        if total_tokens > self.hard_input_tokens:
+            raise ContextWindowExceededError(
+                "对话上下文在工具裁剪和摘要后仍有 "
+                f"{total_tokens} Token，超过模型输入硬上限 "
+                f"{self.hard_input_tokens}；请缩小当前输入或对超大工具结果分段处理。"
+            )
+
+    @staticmethod
+    def _replace_all(messages: Sequence[BaseMessage]) -> dict[str, Any]:
+        return {
+            "messages": [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                *messages,
+            ]
+        }
+
+    def _summarized_result(
+        self,
+        messages: list[BaseMessage],
+        summary: str,
+        *,
+        tools_changed: bool,
+    ) -> dict[str, Any] | None:
+        if summary.startswith("Error generating summary:"):
+            self._assert_below_hard_limit(messages)
+            return self._replace_all(messages) if tools_changed else None
+
+        cutoff = self._recent_turn_cutoff(messages)
+        if cutoff <= 0:
+            self._assert_below_hard_limit(messages)
+            return self._replace_all(messages) if tools_changed else None
+
+        compacted = [
+            *self._build_new_messages(summary),
+            *messages[cutoff:],
+        ]
+        self._assert_below_hard_limit(compacted)
+        return self._replace_all(compacted)
+
+    def _prepare(
+        self,
+        state: dict[str, Any],
+    ) -> tuple[list[BaseMessage], bool, int] | None:
+        messages = list(state.get("messages", []))
+        has_summary = self._has_summary(messages)
+        trigger = self.safety_trigger_tokens if has_summary else self.cost_trigger_tokens
+        if self.token_counter(messages) < trigger:
+            return None
+
+        pruned, tools_changed = self._prune_consumed_tools(
+            messages,
+            safety_mode=has_summary,
+        )
+        return pruned, tools_changed, self._recent_turn_cutoff(pruned)
+
+    def before_model(
+        self,
+        state: dict[str, Any],
+        runtime: Runtime[Any],
+    ) -> dict[str, Any] | None:
+        del runtime
+        prepared = self._prepare(state)
+        if prepared is None:
+            return None
+        messages, tools_changed, cutoff = prepared
+        if cutoff <= 0:
+            self._assert_below_hard_limit(messages)
+            return self._replace_all(messages) if tools_changed else None
+        summary = self._create_summary(messages[:cutoff])
+        return self._summarized_result(
+            messages,
+            summary,
+            tools_changed=tools_changed,
+        )
+
+    async def abefore_model(
+        self,
+        state: dict[str, Any],
+        runtime: Runtime[Any],
+    ) -> dict[str, Any] | None:
+        del runtime
+        prepared = self._prepare(state)
+        if prepared is None:
+            return None
+        messages, tools_changed, cutoff = prepared
+        if cutoff <= 0:
+            self._assert_below_hard_limit(messages)
+            return self._replace_all(messages) if tools_changed else None
+        summary = await self._acreate_summary(messages[:cutoff])
+        return self._summarized_result(
+            messages,
+            summary,
+            tools_changed=tools_changed,
+        )

@@ -31,11 +31,9 @@ from app.agent.mcp_client import (
 from app.config import config
 from app.services.conversation_context_service import (
     CONVERSATION_SUMMARY_PROMPT,
-    OldToolOutputPruningMiddleware,
-    SafeSummarizationMiddleware,
+    QwenChatTokenCounter,
+    TwoTierContextMiddleware,
     build_conversation_context_budget,
-    count_qwen_tokens_conservatively,
-    estimate_fixed_prompt_tokens,
 )
 from app.services.conversation_transcript_service import (
     ConversationTranscriptStore,
@@ -185,26 +183,30 @@ class RagAgentService:
             logger.info(f"成功加载 {len(mcp_tools)} 个 MCP 工具")
 
         all_tools = self.tools + self.mcp_tools
-        fixed_prompt_tokens = estimate_fixed_prompt_tokens(
-            self.system_prompt,
-            all_tools,
+        context_token_counter = QwenChatTokenCounter(
+            model_name=self.model_name,
+            system_prompt=self.system_prompt,
+            tools=all_tools,
         )
+        fixed_prompt_tokens = context_token_counter([])
         self.context_budget = build_conversation_context_budget(
             context_window_tokens=config.chat_model_context_window_tokens,
             max_input_tokens=config.chat_model_max_input_tokens,
             max_output_tokens=config.chat_model_max_output_tokens,
             operating_input_tokens=config.chat_context_operating_input_tokens,
             fixed_prompt_tokens=fixed_prompt_tokens,
+            safety_ratio=config.chat_context_safety_ratio,
+            keep_recent_turns=config.chat_context_keep_turns,
         )
         logger.info(
-            "对话上下文预算: model={}, hard_input={}, operating_input={}, "
-            "fixed_prompt={}, message_trigger={}, keep_recent={}",
+            "对话上下文预算: model={}, hard_input={}, cost_trigger={}, "
+            "safety_trigger={}, fixed_prompt={}, keep_recent_turns={}",
             self.model_name,
             self.context_budget.hard_input_tokens,
-            self.context_budget.effective_input_tokens,
+            self.context_budget.cost_trigger_tokens,
+            self.context_budget.safety_trigger_tokens,
             self.context_budget.fixed_prompt_tokens,
-            self.context_budget.message_trigger_tokens,
-            self.context_budget.keep_recent_tokens,
+            self.context_budget.keep_recent_turns,
         )
 
         self.agent = create_agent(
@@ -212,22 +214,32 @@ class RagAgentService:
             tools=all_tools,
             system_prompt=self.system_prompt,
             middleware=[
-                OldToolOutputPruningMiddleware(
-                    trigger_tokens=self.context_budget.message_trigger_tokens,
-                    keep_recent_tokens=self.context_budget.keep_recent_tokens,
-                    max_tool_output_chars=config.chat_tool_output_max_chars,
-                    token_counter=count_qwen_tokens_conservatively,
-                ),
-                SafeSummarizationMiddleware(
+                TwoTierContextMiddleware(
                     model=self.summary_model,
-                    trigger=(
-                        "tokens",
-                        self.context_budget.message_trigger_tokens,
+                    cost_trigger_tokens=self.context_budget.cost_trigger_tokens,
+                    safety_trigger_tokens=self.context_budget.safety_trigger_tokens,
+                    hard_input_tokens=self.context_budget.hard_input_tokens,
+                    keep_recent_turns=self.context_budget.keep_recent_turns,
+                    max_tool_output_chars=config.chat_tool_output_max_chars,
+                    token_counter=context_token_counter,
+                    summary_input_token_counter=(
+                        context_token_counter.count_messages_only
                     ),
-                    keep=("tokens", self.context_budget.keep_recent_tokens),
-                    token_counter=count_qwen_tokens_conservatively,
+                    summary_text_token_counter=context_token_counter.count_text,
+                    summary_min_output_tokens=(
+                        config.chat_summary_min_output_tokens
+                    ),
+                    summary_max_output_tokens=(
+                        config.chat_summary_max_output_tokens
+                    ),
+                    summary_output_ratio=config.chat_summary_output_ratio,
+                    summary_model_context_window_tokens=(
+                        config.chat_summary_model_context_window_tokens
+                    ),
+                    summary_model_max_input_tokens=(
+                        config.chat_summary_model_max_input_tokens
+                    ),
                     summary_prompt=CONVERSATION_SUMMARY_PROMPT,
-                    trim_tokens_to_summarize=None,
                 ),
             ],
             checkpointer=self.checkpointer,
