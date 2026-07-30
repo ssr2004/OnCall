@@ -59,7 +59,11 @@ const events = [
         message: '诊断流程完成 (2/2)',
         report: '# 告警分析报告\n\n当前没有活动告警。',
         completed_steps: 2,
-        total_steps: 2
+        total_steps: 2,
+        incident_id: 'inc-frontend-test',
+        can_confirm: true,
+        has_active_alerts: true,
+        incident_status: 'pending'
     },
     {
         type: 'complete',
@@ -99,6 +103,7 @@ async function run() {
     const progressSnapshots = [];
     let finalContent = '';
     let finalDetails = [];
+    let finalIncidentMeta = null;
     instance.updateAIOpsProgressCard = (_element, state) => {
         progressSnapshots.push({
             transientStatus: state.transientStatus,
@@ -107,9 +112,10 @@ async function run() {
             plan: [...state.plan]
         });
     };
-    instance.updateAIOpsMessage = (_element, content, details) => {
+    instance.updateAIOpsMessage = (_element, content, details, incidentMeta) => {
         finalContent = content;
         finalDetails = details;
+        finalIncidentMeta = incidentMeta;
     };
 
     await instance.sendAIOpsRequest({});
@@ -125,6 +131,9 @@ async function run() {
         [...finalDetails],
         ['查询 Prometheus 活动告警', '生成诊断报告']
     );
+    assert.equal(finalIncidentMeta.incidentId, 'inc-frontend-test');
+    assert.equal(finalIncidentMeta.canConfirm, true);
+    assert.equal(finalIncidentMeta.hasActiveAlerts, true);
     assert.ok(
         progressSnapshots.some(snapshot => snapshot.transientStatus.includes('正在从 Prometheus 获取')),
         '获取告警状态应在执行期间临时显示'

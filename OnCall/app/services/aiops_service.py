@@ -3,18 +3,20 @@
 基于 LangGraph 官方教程实现
 """
 
-from datetime import datetime, timezone
 import json
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncGenerator, Dict, Any
-from langgraph.graph import StateGraph, END
+from typing import Any, AsyncGenerator, Dict
+
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
 from loguru import logger
 
-from app.agent.aiops import PlanExecuteState, planner, executor, replanner
+from app.agent.aiops import PlanExecuteState, executor, planner, replanner
 from app.agent.mcp_client import get_mcp_client_with_retry
 from app.config import config
-
+from app.models.incident import PendingIncident
+from app.services.incident_memory_service import incident_memory_service
 
 # 节点名称常量
 NODE_PLANNER = "planner"
@@ -356,14 +358,34 @@ class AIOpsService:
         alert_total = int(active_alerts.get("total", 0) or 0)
         logger.info(f"[会话 {session_id}] 预取活动告警完成: total={alert_total}")
 
+        current_incident_id = None
+        similar_incidents: list[dict[str, Any]] = []
+        if alert_total > 0:
+            fingerprint = incident_memory_service.build_alert_fingerprint(active_alerts)
+            current_incident_id = f"inc-{fingerprint[:32]}"
+            similar_incidents = await incident_memory_service.search_for_alerts(
+                active_alerts,
+                current_incident_id=current_incident_id,
+            )
+            logger.info(
+                f"[会话 {session_id}] 历史情景记忆检索完成: "
+                f"similar={len(similar_incidents)}"
+            )
+
         # 使用固定的 AIOps 任务描述
         from textwrap import dedent
         alerts_json = json.dumps(active_alerts, ensure_ascii=False, indent=2)
+        historical_incidents_json = incident_memory_service.compact_for_prompt(
+            similar_incidents
+        )
         aiops_task = dedent(f"""诊断当前电网数据采集与同步服务是否存在告警。如果存在告警，请基于 Prometheus 电网业务指标、同一时间窗口的服务日志和知识库处置手册分析原因并生成诊断报告；如果没有告警，请如实说明当前服务状态。
 
                 PREFETCHED_ACTIVE_ALERTS_TOTAL={alert_total}
                 PREFETCHED_ACTIVE_ALERTS_JSON:
                 {alerts_json}
+
+                CONFIRMED_HISTORICAL_INCIDENTS_JSON:
+                {historical_incidents_json}
 
                 上述预取告警是本次诊断的权威事实基线，不要再次使用带 severity、state 或 alert_name 过滤条件的查询覆盖它。诊断报告输出格式要求：
                 ```
@@ -437,8 +459,12 @@ class AIOpsService:
                 **重要提醒**：
                 - 最终输出必须是纯 Markdown 文本，不要包含 JSON 结构
                 - 所有内容必须基于工具查询的真实数据，严禁编造
+                - 当前 Prometheus 指标和本次日志是权威证据；已确认历史事件只能作为辅助参考，不得用历史根因替代本次证据
+                - 如果引用历史事件，必须明确标注为“历史相似事件参考”，并保留 incident_id
+                - 如果处置手册检索结果包含 [来源N]，处理建议和知识性结论必须保留对应引用，并在报告末尾列出实际引用的文件、章节和片段ID
                 - 如果某个步骤失败，在结论中如实说明，不要跳过""")
 
+        candidate: PendingIncident | None = None
         async for event in self.execute(aiops_task, session_id):
             if event.get("type") == "error":
                 logger.warning(
@@ -448,14 +474,40 @@ class AIOpsService:
                 async for fallback_event in self._diagnose_grid_deterministically(
                     active_alerts=active_alerts,
                     mcp_tools=mcp_tools,
+                    similar_incidents=similar_incidents,
                 ):
+                    fallback_report = str(fallback_event.get("report") or "")
+                    if fallback_report and candidate is None:
+                        candidate = incident_memory_service.create_candidate(
+                            session_id=session_id,
+                            active_alerts=active_alerts,
+                            report=fallback_report,
+                            diagnosis_mode="deterministic_fallback",
+                            similar_incidents=similar_incidents,
+                        )
+                    fallback_event = self._with_incident_metadata(
+                        fallback_event,
+                        candidate,
+                        alert_total,
+                        len(similar_incidents),
+                    )
                     yield fallback_event
                 return
+
+            report = str(event.get("report") or event.get("response") or "")
+            if report and candidate is None:
+                candidate = incident_memory_service.create_candidate(
+                    session_id=session_id,
+                    active_alerts=active_alerts,
+                    report=report,
+                    diagnosis_mode="llm",
+                    similar_incidents=similar_incidents,
+                )
 
             # 转换事件格式以兼容旧的 API
             if event.get("type") == "complete":
                 # 将 response 包装为 diagnosis 格式
-                yield {
+                complete_event = {
                     "type": "complete",
                     "stage": "diagnosis_complete",
                     "message": event.get("message", "诊断流程完成"),
@@ -468,13 +520,46 @@ class AIOpsService:
                         "report": event.get("response", "")
                     }
                 }
+                yield self._with_incident_metadata(
+                    complete_event,
+                    candidate,
+                    alert_total,
+                    len(similar_incidents),
+                )
             else:
-                yield event
+                yield self._with_incident_metadata(
+                    event,
+                    candidate,
+                    alert_total,
+                    len(similar_incidents),
+                )
+
+    @staticmethod
+    def _with_incident_metadata(
+        event: Dict[str, Any],
+        candidate: PendingIncident | None,
+        alert_total: int,
+        similar_incident_count: int,
+    ) -> Dict[str, Any]:
+        """向报告/完成事件附加人工确认所需的稳定字段。"""
+        enriched = dict(event)
+        enriched["has_active_alerts"] = alert_total > 0
+        enriched["similar_incident_count"] = similar_incident_count
+        if candidate is not None:
+            enriched["incident_id"] = candidate.incident_id
+            enriched["can_confirm"] = candidate.status == "pending"
+            enriched["incident_status"] = candidate.status
+        else:
+            enriched["incident_id"] = None
+            enriched["can_confirm"] = False
+            enriched["incident_status"] = None
+        return enriched
 
     async def _diagnose_grid_deterministically(
         self,
         active_alerts: Dict[str, Any],
         mcp_tools: list[Any],
+        similar_incidents: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """外部模型不可用时，仍基于实时证据完成可演示的电网诊断。"""
         yield {
@@ -600,7 +685,11 @@ class AIOpsService:
                 }
             )
 
-        report = self._format_deterministic_grid_report(evidence_records, now)
+        report = self._format_deterministic_grid_report(
+            evidence_records,
+            now,
+            similar_incidents=similar_incidents or [],
+        )
         yield {
             "type": "report",
             "stage": "final_report",
@@ -720,6 +809,7 @@ class AIOpsService:
         cls,
         evidence_records: list[Dict[str, Any]],
         generated_at: str,
+        similar_incidents: list[dict[str, Any]] | None = None,
     ) -> str:
         lines = [
             "# 告警分析报告",
@@ -818,6 +908,26 @@ class AIOpsService:
                     f"- 处置手册来源：`{knowledge.get('source', 'unknown')}`",
                 ]
             )
+
+        if similar_incidents:
+            lines.extend(
+                [
+                    "",
+                    "## 历史相似事件参考",
+                    "",
+                    "> 以下内容来自人工确认过的历史事件，仅用于辅助比对；本次指标和日志仍是根因判断的权威证据。",
+                    "",
+                ]
+            )
+            for item in similar_incidents[: config.incident_rrf_final_k]:
+                lines.append(
+                    "- `{incident_id}`：{alert_name} / {service_name}（RRF {score:.6f}）".format(
+                        incident_id=item.get("incident_id", "unknown"),
+                        alert_name=item.get("alert_name", "unknown"),
+                        service_name=item.get("service_name", "unknown"),
+                        score=float(item.get("rrf_score", 0.0)),
+                    )
+                )
 
         lines.extend(
             [

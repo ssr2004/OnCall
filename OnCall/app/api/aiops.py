@@ -3,12 +3,24 @@ AIOps 智能运维接口
 """
 
 import json
-from fastapi import APIRouter
-from sse_starlette.sse import EventSourceResponse
-from loguru import logger
 
+from fastapi import APIRouter, HTTPException
+from loguru import logger
+from sse_starlette.sse import EventSourceResponse
+
+from app.config import config
 from app.models.aiops import AIOpsRequest
+from app.models.incident import (
+    IncidentDecisionResponse,
+    IncidentSearchRequest,
+)
 from app.services.aiops_service import aiops_service
+from app.services.incident_memory_service import (
+    IncidentDecisionConflictError,
+    IncidentMemoryError,
+    IncidentNotFoundError,
+    incident_memory_service,
+)
 from app.services.rag_agent_service import rag_agent_service
 
 router = APIRouter()
@@ -18,6 +30,74 @@ router = APIRouter()
 async def get_alert_status():
     """返回当前 Prometheus 活动告警摘要，不调用大模型。"""
     return await aiops_service.get_alert_status()
+
+
+@router.get("/aiops/incidents/{incident_id}")
+async def get_incident(incident_id: str):
+    """查询当前进程中的候选事件状态。"""
+    try:
+        return incident_memory_service.get_candidate(incident_id).model_dump()
+    except IncidentNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/aiops/incidents/{incident_id}/confirm",
+    response_model=IncidentDecisionResponse,
+)
+async def confirm_incident(incident_id: str):
+    """人工确认诊断，并将事件写入 Milvus 长期情景记忆。"""
+    try:
+        result = await incident_memory_service.confirm_incident(incident_id)
+        return IncidentDecisionResponse(**result)
+    except IncidentNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except IncidentDecisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IncidentMemoryError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"确认故障事件失败: {exc}", exc_info=True)
+        raise HTTPException(status_code=503, detail=f"情景记忆写入失败: {exc}") from exc
+
+
+@router.post(
+    "/aiops/incidents/{incident_id}/reject",
+    response_model=IncidentDecisionResponse,
+)
+async def reject_incident(incident_id: str):
+    """人工拒绝诊断，候选报告不会写入 Milvus。"""
+    try:
+        result = await incident_memory_service.reject_incident(incident_id)
+        return IncidentDecisionResponse(**result)
+    except IncidentNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except IncidentDecisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/aiops/incidents/search")
+async def search_incidents(request: IncidentSearchRequest):
+    """使用 Dense + BM25 + RRF 检索已确认的历史故障事件。"""
+    items = await incident_memory_service.search(
+        request.query,
+        current_incident_id=request.current_incident_id,
+        limit=request.limit,
+    )
+    return {
+        "success": True,
+        "total": len(items),
+        "items": items,
+        "retrieval": {
+            "dense_k": config.incident_dense_recall_k,
+            "bm25_k": config.incident_bm25_recall_k,
+            "final_k": min(
+                request.limit or config.incident_rrf_final_k,
+                config.incident_rrf_final_k,
+            ),
+            "rrf_rank_constant": config.incident_rrf_rank_constant,
+        },
+    }
 
 
 @router.post("/aiops")

@@ -2,6 +2,7 @@
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
+set "COMPOSE_PROJECT_NAME=oncall"
 
 if /I "%~1"=="--encoding-check" (
     echo START_SCRIPT_CHECK_OK
@@ -31,7 +32,7 @@ if /I "%~1"=="--preflight-check" (
 )
 
 REM Check for uv; fall back to pip when it is unavailable.
-echo [1/9] Checking package manager...
+echo [1/8] Checking package manager...
 where uv >nul 2>&1
 if errorlevel 1 (
     echo [INFO] uv was not found; pip will be used.
@@ -44,7 +45,7 @@ if errorlevel 1 (
 echo.
 
 REM Ensure a compatible Python version is configured.
-echo [2/9] Configuring Python version...
+echo [2/8] Configuring Python version...
 if exist .python-version (
     set /p PYTHON_VERSION=<.python-version
     echo [INFO] Configured version: !PYTHON_VERSION!
@@ -63,7 +64,7 @@ if exist .python-version (
 echo.
 
 REM Create or synchronize the virtual environment.
-echo [3/9] Preparing virtual environment...
+echo [3/8] Preparing virtual environment...
 if exist .venv\Scripts\python.exe (
     echo [INFO] Existing virtual environment found; checking dependencies...
     
@@ -123,41 +124,39 @@ echo.
 REM Configure the project Python executable.
 set PYTHON_CMD=.venv\Scripts\python.exe
 
-REM Reuse fixed-name Milvus containers from an older Compose project when present.
-REM This avoids container_name conflicts; the current project starts only Prometheus.
-echo [4/9] Starting Milvus and Prometheus infrastructure...
-set MILVUS_STACK_EXISTS=1
-for %%c in (milvus-etcd milvus-minio milvus-standalone milvus-attu) do (
-    docker container inspect %%c >nul 2>&1
-    if errorlevel 1 set MILVUS_STACK_EXISTS=0
-)
-
-if "!MILVUS_STACK_EXISTS!"=="1" (
-    echo [INFO] Existing Milvus containers detected; reusing them...
-    docker start milvus-etcd milvus-minio milvus-standalone milvus-attu >nul
+REM Start only the infrastructure owned by this Compose project.
+REM Compose will reject unrelated containers that reuse the same fixed names.
+echo [4/8] Starting Milvus and Prometheus infrastructure...
+docker network inspect milvus >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] Creating the shared Milvus Docker network...
+    docker network create milvus >nul
     if errorlevel 1 (
-        echo [ERROR] Failed to start the existing Milvus containers.
+        echo [ERROR] Failed to create the Milvus Docker network.
         pause
         exit /b 1
     )
-    echo [INFO] Starting only Prometheus with the current Compose project...
-    docker compose -f vector-database.yml up -d prometheus
-) else (
-    echo [INFO] No complete existing Milvus stack found; creating the infrastructure with Compose...
-    docker compose -f vector-database.yml up -d
 )
+docker compose -f vector-database.yml up -d
 if errorlevel 1 (
-    echo [ERROR] Docker startup failed. Check Docker Desktop and image network access.
+    echo [ERROR] Docker startup failed.
+    echo [TIP] Check Docker Desktop, image access, and fixed-name container conflicts.
     pause
     exit /b 1
 )
-echo [INFO] Waiting 10 seconds for the infrastructure...
-timeout /t 10 /nobreak >nul
-echo [OK] Milvus and Prometheus infrastructure started.
+echo [INFO] Waiting for etcd, MinIO, Milvus, and Prometheus health checks...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\wait-docker-infrastructure.ps1" -ComposeProject "%COMPOSE_PROJECT_NAME%"
+if errorlevel 1 (
+    echo [ERROR] Docker infrastructure did not become healthy.
+    echo [TIP] Run: docker compose -f vector-database.yml ps
+    pause
+    exit /b 1
+)
+echo [OK] Milvus and Prometheus infrastructure is healthy.
 echo.
 
 REM Start the grid data collection and synchronization simulator.
-echo [5/9] Starting grid service simulator...
+echo [5/8] Starting grid service simulator...
 start "Grid Service Simulator" /min %PYTHON_CMD% -m uvicorn grid_simulator.service:app --host 0.0.0.0 --port 9105
 timeout /t 3 /nobreak >nul
 curl -s -f http://localhost:9105/health >nul 2>&1
@@ -169,43 +168,48 @@ if errorlevel 1 (
 echo.
 
 REM Start the CLS MCP server.
-echo [6/9] Starting CLS MCP server...
+echo [6/8] Starting CLS MCP server...
 start "CLS MCP Server" /min %PYTHON_CMD% mcp_servers/cls_server.py
 timeout /t 2 /nobreak >nul
 echo [OK] CLS MCP server started.
 echo.
 
 REM Start the Monitor MCP server.
-echo [7/9] Starting Monitor MCP server...
+echo [7/8] Starting Monitor MCP server...
 start "Monitor MCP Server" /min %PYTHON_CMD% mcp_servers/monitor_server.py
 timeout /t 2 /nobreak >nul
 echo [OK] Monitor MCP server started.
 echo.
 
 REM Start the FastAPI server.
-echo [8/9] Starting FastAPI server...
-start "SuperBizAgent API" %PYTHON_CMD% -m uvicorn app.main:app --host 0.0.0.0 --port 9900
-echo [INFO] Waiting 15 seconds for the API...
-timeout /t 15 /nobreak >nul
-echo.
+echo [8/8] Starting FastAPI server...
+curl -s -f http://localhost:9900/health >nul 2>&1
+if errorlevel 1 (
+    start "SuperBizAgent API" %PYTHON_CMD% -m uvicorn app.main:app --host 0.0.0.0 --port 9900
+) else (
+    echo [INFO] FastAPI is already running; reusing the healthy process.
+)
+echo [INFO] Waiting for the FastAPI health endpoint...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\wait-http-endpoint.ps1" -Uri "http://localhost:9900/health" -ServiceName "FastAPI" -TimeoutSeconds 60
+if errorlevel 1 (
+    echo [ERROR] FastAPI failed to become healthy. Review logs\app_*.log.
+    pause
+    exit /b 1
+)
 
-REM Check API status and upload runbooks.
+REM Check API status. Knowledge documents persist in Milvus and are uploaded from the Web UI.
 echo.
 echo [INFO] Checking API status...
 curl -s http://localhost:9900/health >nul 2>&1
 if errorlevel 1 (
-    echo [WARN] The API may still be starting. Wait a little longer and check the process window.
+    echo [ERROR] FastAPI health verification failed unexpectedly.
+    pause
+    exit /b 1
 ) else (
     echo [OK] FastAPI server is healthy.
     echo.
-    
-    REM Upload aiops-docs files through the API.
-    echo [9/9] Uploading runbooks to the vector database...
-    for %%f in (aiops-docs\*.md) do (
-        echo   Uploading: %%~nxf
-        curl -s -X POST http://localhost:9900/api/upload -F "file=@%%f" >nul 2>&1
-    )
-    echo [OK] Runbook upload completed.
+    echo [INFO] Knowledge documents are persisted in Milvus.
+    echo [INFO] Upload new or updated .md/.txt files from the Web UI when needed.
 )
 
 echo.

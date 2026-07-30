@@ -137,10 +137,14 @@ async def executor(state: PlanExecuteState) -> Dict[str, Any]:
         all_tools = local_tools + mcp_tools
 
         # 创建 LLM（绑定工具）
+        logger.info("Executor 模型: {}", config.aiops_executor_model)
         llm = ChatQwen(
-            model=config.rag_model,
+            model=config.aiops_executor_model,
             api_key=config.dashscope_api_key,
-            temperature=0
+            base_url=config.dashscope_api_base,
+            temperature=0,
+            max_tokens=config.aiops_executor_max_output_tokens,
+            enable_thinking=False,
         )
         llm_with_tools = llm.bind_tools(all_tools)
 

@@ -79,3 +79,6 @@ dmypy.json
 # Ruff
 .ruff_cache/
 
+# RAG evaluation runtime artifacts
+evaluations/rag/results/
+evaluations/rag/.cache/

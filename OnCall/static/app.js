@@ -1,5 +1,5 @@
 // SuperBizAgent 前端应用
-const FRONTEND_BUILD = globalThis.__FRONTEND_BUILD__ || '20260728-aiops-context-v2';
+const FRONTEND_BUILD = globalThis.__FRONTEND_BUILD__ || '20260728-incident-memory-v1';
 console.info(`[SuperBizAgent] frontend build: ${FRONTEND_BUILD}`);
 
 class SuperBizAgentApp {
@@ -759,7 +759,7 @@ ${report}
     async sendQuickMessage(message) {
         // 添加等待提示消息
         const loadingMessage = this.addLoadingMessage('正在思考...');
-        const questionWithContext = this.buildQuestionWithAIOpsContext(message);
+        const questionWithContext = message;
         
         try {
             const response = await fetch(`${this.apiBaseUrl}/chat`, {
@@ -817,7 +817,7 @@ ${report}
 
     // 发送流式消息
     async sendStreamMessage(message) {
-        const questionWithContext = this.buildQuestionWithAIOpsContext(message);
+        const questionWithContext = message;
         try {
             const response = await fetch(`${this.apiBaseUrl}/chat_stream`, {
                 method: 'POST',
@@ -1284,7 +1284,11 @@ ${report}
                 totalSteps: 0,
                 transientStatus: '',
                 terminalMessage: '',
-                report: ''
+                report: '',
+                incidentId: '',
+                canConfirm: false,
+                hasActiveAlerts: false,
+                incidentStatus: ''
             };
 
             const normalizeStepText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -1331,6 +1335,13 @@ ${report}
 
             const getPlanDetails = () => progressState.plan.map(step => normalizeStepText(step));
 
+            const getIncidentMeta = () => ({
+                incidentId: progressState.incidentId,
+                canConfirm: progressState.canConfirm,
+                hasActiveAlerts: progressState.hasActiveAlerts,
+                incidentStatus: progressState.incidentStatus
+            });
+
             const renderAIOpsFinal = () => {
                 const sections = [];
 
@@ -1351,6 +1362,18 @@ ${report}
 
             const applyAIOpsEvent = (sseMessage) => {
                 updateProgressCounts(sseMessage);
+                if (Object.prototype.hasOwnProperty.call(sseMessage, 'incident_id')) {
+                    progressState.incidentId = sseMessage.incident_id || '';
+                }
+                if (Object.prototype.hasOwnProperty.call(sseMessage, 'can_confirm')) {
+                    progressState.canConfirm = Boolean(sseMessage.can_confirm);
+                }
+                if (Object.prototype.hasOwnProperty.call(sseMessage, 'has_active_alerts')) {
+                    progressState.hasActiveAlerts = Boolean(sseMessage.has_active_alerts);
+                }
+                if (Object.prototype.hasOwnProperty.call(sseMessage, 'incident_status')) {
+                    progressState.incidentStatus = sseMessage.incident_status || '';
+                }
                 switch (sseMessage.type) {
                     case 'content':
                         progressState.content += sseMessage.data || '';
@@ -1463,7 +1486,8 @@ ${report}
                             this.updateAIOpsMessage(
                                 loadingMessageElement,
                                 fullResponse,
-                                getPlanDetails()
+                                getPlanDetails(),
+                                getIncidentMeta()
                             );
                         }
                         break;
@@ -1507,7 +1531,8 @@ ${report}
                                 this.updateAIOpsMessage(
                                     loadingMessageElement,
                                     fullResponse,
-                                    getPlanDetails()
+                                    getPlanDetails(),
+                                    getIncidentMeta()
                                 );
                                 return;
                             }
@@ -1682,7 +1707,7 @@ ${report}
     }
 
     // 更新智能运维消息（带折叠详情）
-    updateAIOpsMessage(messageElement, response, details) {
+    updateAIOpsMessage(messageElement, response, details, incidentMeta = null) {
         console.log('updateAIOpsMessage 被调用');
         console.log('messageElement:', messageElement);
         console.log('response:', response);
@@ -1697,7 +1722,7 @@ ${report}
         if (!messageElement) {
             // 如果没有传入消息元素，则创建新消息
             console.log('messageElement 为空，创建新消息');
-            return this.addAIOpsMessage(response, details);
+            return this.addAIOpsMessage(response, details, incidentMeta);
         }
 
         // 添加aiops-message类
@@ -1781,6 +1806,15 @@ ${report}
         // 高亮代码块
         this.highlightCodeBlocks(messageContent);
         console.log('代码块高亮完成');
+
+        if (
+            incidentMeta
+            && incidentMeta.incidentId
+            && incidentMeta.canConfirm
+            && incidentMeta.hasActiveAlerts
+        ) {
+            this.renderIncidentActions(messageContent, incidentMeta);
+        }
         
         // 保存到历史记录
         const alreadyRecorded = this.currentChatHistory.some(message => (
@@ -1810,7 +1844,7 @@ ${report}
     }
 
     // 添加智能运维消息（带折叠详情）- 保留用于兼容性
-    addAIOpsMessage(response, details) {
+    addAIOpsMessage(response, details, incidentMeta = null) {
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message assistant aiops-message';
 
@@ -1869,6 +1903,14 @@ ${report}
         messageContent.innerHTML = this.renderMarkdown(response);
         // 高亮代码块
         this.highlightCodeBlocks(messageContent);
+        if (
+            incidentMeta
+            && incidentMeta.incidentId
+            && incidentMeta.canConfirm
+            && incidentMeta.hasActiveAlerts
+        ) {
+            this.renderIncidentActions(messageContent, incidentMeta);
+        }
         messageContentWrapper.appendChild(messageContent);
         messageDiv.appendChild(messageContentWrapper);
         
@@ -1878,6 +1920,96 @@ ${report}
         }
 
         return messageDiv;
+    }
+
+    // 在有活动告警的最终报告下方提供轻量人工反馈，不增加独立页面。
+    renderIncidentActions(messageContent, incidentMeta) {
+        if (!messageContent || !incidentMeta || !incidentMeta.incidentId) return;
+
+        const existing = messageContent.querySelector('.incident-memory-actions');
+        if (existing) existing.remove();
+
+        const actions = document.createElement('div');
+        actions.className = 'incident-memory-actions';
+        actions.dataset.incidentId = incidentMeta.incidentId;
+
+        const hint = document.createElement('span');
+        hint.className = 'incident-memory-hint';
+        hint.textContent = '这份诊断是否准确？';
+
+        const buttons = document.createElement('div');
+        buttons.className = 'incident-memory-buttons';
+
+        const confirmButton = document.createElement('button');
+        confirmButton.type = 'button';
+        confirmButton.className = 'incident-memory-button incident-memory-confirm';
+        confirmButton.textContent = '确认诊断';
+
+        const rejectButton = document.createElement('button');
+        rejectButton.type = 'button';
+        rejectButton.className = 'incident-memory-button incident-memory-reject';
+        rejectButton.textContent = '诊断不准确';
+
+        const status = document.createElement('span');
+        status.className = 'incident-memory-status';
+        status.setAttribute('role', 'status');
+        status.setAttribute('aria-live', 'polite');
+
+        const decide = async (decision) => {
+            confirmButton.disabled = true;
+            rejectButton.disabled = true;
+            actions.classList.add('is-pending');
+            status.className = 'incident-memory-status';
+            status.textContent = decision === 'confirm'
+                ? '正在写入情景记忆...'
+                : '正在记录反馈...';
+            try {
+                const result = await this.submitIncidentDecision(
+                    incidentMeta.incidentId,
+                    decision
+                );
+                actions.classList.remove('is-pending');
+                actions.classList.add(decision === 'confirm' ? 'is-confirmed' : 'is-rejected');
+                status.classList.add('is-success');
+                status.textContent = result.message || (
+                    decision === 'confirm'
+                        ? '已确认并写入情景记忆'
+                        : '本次报告不会写入情景记忆'
+                );
+            } catch (error) {
+                actions.classList.remove('is-pending');
+                status.classList.add('is-error');
+                status.textContent = error.message || '操作失败，请重试';
+                confirmButton.disabled = false;
+                rejectButton.disabled = false;
+            }
+        };
+
+        confirmButton.addEventListener('click', () => decide('confirm'));
+        rejectButton.addEventListener('click', () => decide('reject'));
+        buttons.append(confirmButton, rejectButton);
+        actions.append(hint, buttons, status);
+        messageContent.appendChild(actions);
+    }
+
+    async submitIncidentDecision(incidentId, decision) {
+        if (!['confirm', 'reject'].includes(decision)) {
+            throw new Error('不支持的诊断反馈类型');
+        }
+        const response = await fetch(
+            `${this.apiBaseUrl}/aiops/incidents/${encodeURIComponent(incidentId)}/${decision}`,
+            { method: 'POST' }
+        );
+        let payload = {};
+        try {
+            payload = await response.json();
+        } catch (error) {
+            payload = {};
+        }
+        if (!response.ok) {
+            throw new Error(payload.detail || `操作失败（HTTP ${response.status}）`);
+        }
+        return payload;
     }
 
     // HTML转义

@@ -101,6 +101,8 @@ response_prompt = ChatPromptTemplate.from_messages(
                 - 基于实际数据，不要编造
                 - 如果某些步骤失败，要诚实说明
                 - 使用 Markdown 格式
+                - 如果执行历史中的知识库资料包含 [来源N]，相关处置建议和知识性结论必须保留对应来源编号
+                - 回答末尾增加“参考来源”，只列出实际引用过的文件、章节和片段ID
             """).strip(),
         ),
         ("placeholder", "{messages}"),
@@ -145,12 +147,7 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
     MAX_STEPS = 8
     if len(past_steps) >= MAX_STEPS:
         logger.warning(f"已执行 {len(past_steps)} 个步骤，超过最大限制 {MAX_STEPS}，强制生成最终响应")
-        llm = ChatQwen(
-            model=config.rag_model,
-            api_key=config.dashscope_api_key,
-            temperature=0
-        )
-        return await _generate_response(state, llm)
+        return await _generate_response(state)
 
     # 获取可用工具列表
     try:
@@ -172,10 +169,14 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
         tools_description = "无法获取工具列表"
 
     # 创建 LLM
+    logger.info("Replanner 模型: {}", config.aiops_replanner_model)
     llm = ChatQwen(
-        model=config.rag_model,
+        model=config.aiops_replanner_model,
         api_key=config.dashscope_api_key,
-        temperature=0
+        base_url=config.dashscope_api_base,
+        temperature=0,
+        max_tokens=config.aiops_replanner_max_output_tokens,
+        enable_thinking=False,
     )
 
     # 格式化已执行的步骤
@@ -216,7 +217,7 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
 
             if action == "respond":
                 logger.info("决定生成最终响应")
-                return await _generate_response(state, llm)
+                return await _generate_response(state)
 
             elif action == "replan":
                 # ⚠️ 强制限制：新步骤数不能超过当前剩余步骤数
@@ -230,7 +231,7 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
                 # ⚠️ 二次检查：如果已执行步骤 >= 5，禁止 replan
                 if len(past_steps) >= 5:
                     logger.warning(f"已执行 {len(past_steps)} 个步骤，禁止重新规划，强制生成响应")
-                    return await _generate_response(state, llm)
+                    return await _generate_response(state)
                 
                 logger.info(f"决定调整计划，新步骤数量: {len(new_steps)}")
                 if new_steps:
@@ -251,11 +252,11 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
     else:
         # 没有剩余计划，生成最终响应
         logger.info("计划已执行完毕，生成最终响应")
-        return await _generate_response(state, llm)
+        return await _generate_response(state)
 
 
-async def _generate_response(state: PlanExecuteState, llm: ChatQwen) -> Dict[str, Any]:
-    """生成最终响应"""
+async def _generate_response(state: PlanExecuteState) -> Dict[str, Any]:
+    """使用 Max 生成最终报告；Max 不可用时降级到 Replanner 的 Plus。"""
     logger.info("生成最终响应...")
 
     input_text = state.get("input", "")
@@ -267,32 +268,49 @@ async def _generate_response(state: PlanExecuteState, llm: ChatQwen) -> Dict[str
         for step, result in past_steps
     ])
 
-    response_gen = response_prompt | llm.with_structured_output(Response)
+    messages = [
+        ("user", f"原始任务: {input_text}"),
+        ("user", f"执行历史:\n{execution_history}"),
+        ("user", "请基于以上信息生成全面的最终响应"),
+    ]
+    report_models = [config.aiops_report_model]
+    if config.aiops_replanner_model not in report_models:
+        report_models.append(config.aiops_replanner_model)
 
-    try:
-        messages = [
-            ("user", f"原始任务: {input_text}"),
-            ("user", f"执行历史:\n{execution_history}"),
-            ("user", "请基于以上信息生成全面的最终响应")
-        ]
+    for model_name in report_models:
+        try:
+            max_tokens = (
+                config.aiops_report_max_output_tokens
+                if model_name == config.aiops_report_model
+                else config.aiops_replanner_max_output_tokens
+            )
+            llm = ChatQwen(
+                model=model_name,
+                api_key=config.dashscope_api_key,
+                base_url=config.dashscope_api_base,
+                temperature=0,
+                max_tokens=max_tokens,
+                enable_thinking=False,
+            )
+            response_gen = response_prompt | llm.with_structured_output(Response)
+            response_obj = await response_gen.ainvoke({"messages": messages})
 
-        response_obj = await response_gen.ainvoke({"messages": messages})
+            if isinstance(response_obj, Response):
+                final_response = response_obj.response
+            else:
+                final_response = response_obj.get("response", "")  # type: ignore
 
-        # 处理返回结果
-        if isinstance(response_obj, Response):
-            final_response = response_obj.response
-        else:
-            # 如果返回的是字典
-            final_response = response_obj.get("response", "")  # type: ignore
+            logger.info(
+                "最终响应生成完成，model={}, 长度={}",
+                model_name,
+                len(final_response),
+            )
+            return {"response": final_response}
+        except Exception as e:
+            logger.error("模型 {} 生成最终响应失败: {}", model_name, e)
 
-        logger.info(f"最终响应生成完成，长度: {len(final_response)}")
-
-        return {"response": final_response}
-
-    except Exception as e:
-        logger.error(f"生成响应失败: {e}")
-        # 生成简单的后备响应
-        fallback_response = f"""# 任务执行结果
+    # 两级生成模型均不可用时，保留已收集证据并返回确定性后备报告。
+    fallback_response = f"""# 任务执行结果
 
 ## 原始任务
 {input_text}
@@ -303,7 +321,7 @@ async def _generate_response(state: PlanExecuteState, llm: ChatQwen) -> Dict[str
 ## 说明
 由于系统异常，无法生成完整响应。以上是已收集的信息。
 """
-        return {"response": fallback_response}
+    return {"response": fallback_response}
 
 
 def _format_simple_steps(past_steps: list) -> str:

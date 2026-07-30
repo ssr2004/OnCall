@@ -1,4 +1,4 @@
-"""知识检索工具 - 从向量数据库中检索相关信息"""
+"""知识检索工具 - 查询改写、混合召回、RRF 与模型精排。"""
 
 from typing import List, Tuple
 
@@ -6,13 +6,12 @@ from langchain_core.documents import Document
 from langchain_core.tools import tool
 from loguru import logger
 
-from app.config import config
-from app.services.vector_store_manager import vector_store_manager
+from app.services.hybrid_knowledge_service import hybrid_knowledge_service
 
 
 @tool(response_format="content_and_artifact")
-def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
-    """从知识库中检索相关信息来回答问题
+async def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
+    """从知识库检索资料；回答必须使用工具返回的 [来源N] 标注依据。
     
     当用户的问题涉及专业知识、文档内容或需要参考资料时，使用此工具。
     
@@ -25,13 +24,8 @@ def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
     try:
         logger.info(f"知识检索工具被调用: query='{query}'")
         
-        # 从向量存储中检索相关文档
-        vector_store = vector_store_manager.get_vector_store()
-        retriever = vector_store.as_retriever(
-            search_kwargs={"k": config.rag_top_k}
-        )
-        
-        docs = retriever.invoke(query)
+        rewritten, items = await hybrid_knowledge_service.search(query)
+        docs = hybrid_knowledge_service.to_documents(items)
         
         if not docs:
             logger.warning("未检索到相关文档")
@@ -39,6 +33,14 @@ def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
         
         # 格式化文档为上下文
         context = format_docs(docs)
+        context = (
+            "以下资料经过查询改写、Dense/BM25 混合召回、RRF 融合和百炼精排。\n"
+            f"语义检索问题：{rewritten.semantic_query}\n"
+            f"BM25关键词：{', '.join(rewritten.keywords)}\n\n"
+            f"{context}\n\n"
+            "引用要求：只能依据上述资料陈述知识性结论，并在相关句末使用"
+            "[来源1]、[来源2]格式标注；回答末尾列出实际引用的来源。"
+        )
         
         logger.info(f"检索到 {len(docs)} 个相关文档")
         return context, docs
@@ -74,10 +76,17 @@ def format_docs(docs: List[Document]) -> str:
         header_str = " > ".join(headers) if headers else ""
         
         # 构建格式化文本
-        formatted = f"【参考资料 {i}】"
+        source_id = metadata.get("source_id", f"来源{i}")
+        formatted = f"[{source_id}]"
         if header_str:
             formatted += f"\n标题: {header_str}"
-        formatted += f"\n来源: {source}"
+        formatted += f"\n文件: {source}"
+        formatted += f"\n片段ID: {metadata.get('chunk_id', 'unknown')}"
+        rerank_score = metadata.get("rerank_score")
+        if rerank_score is not None:
+            formatted += f"\n精排分数: {float(rerank_score):.6f}"
+        elif metadata.get("rerank_fallback"):
+            formatted += "\n精排状态: 百炼不可用，使用RRF降级排序"
         formatted += f"\n内容:\n{doc.page_content}\n"
         
         formatted_parts.append(formatted)

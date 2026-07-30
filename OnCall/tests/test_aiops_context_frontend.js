@@ -78,11 +78,11 @@ async function run() {
 
     assert.equal(requestedUrl, 'http://localhost:9900/api/chat');
     assert.equal(requestedBody.Id, 'frontend-aiops-context-test');
-    assert.match(requestedBody.Question, /<AIOPS_DIAGNOSIS_REPORT>/);
-    assert.match(requestedBody.Question, /GridDataSyncServiceDown/);
-    assert.match(requestedBody.Question, /上面的报告说明了什么/);
-    assert.match(requestedBody.Question, /不要要求用户再次提供报告/);
-    assert.notEqual(requestedBody.Question, userQuestion);
+    assert.equal(
+        requestedBody.Question,
+        userQuestion,
+        'AIOps 报告已由后端交接，前端不应在每轮追问中重复拼接整份报告'
+    );
     assert.deepEqual(visibleMessages, [
         {
             type: 'assistant',

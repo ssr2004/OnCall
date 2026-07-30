@@ -46,6 +46,9 @@ dev = [
     "ipython>=8.20.0",
     "ipdb>=0.13.13",
 ]
+eval = [
+    "ragas==0.4.3",
+]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -53,7 +56,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["app*"]
+include = ["app*", "evaluations*"]
 
 
 

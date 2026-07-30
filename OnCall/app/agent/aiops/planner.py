@@ -174,10 +174,14 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
             experience_context = ""
 
         # 步骤4: 创建 LLM 并生成计划
+        logger.info("Planner 模型: {}", config.aiops_planner_model)
         llm = ChatQwen(
-            model=config.rag_model,
+            model=config.aiops_planner_model,
             api_key=config.dashscope_api_key,
-            temperature=0
+            base_url=config.dashscope_api_base,
+            temperature=0,
+            max_tokens=config.aiops_planner_max_output_tokens,
+            enable_thinking=False,
         )
 
         planner_chain = planner_prompt | llm.with_structured_output(Plan)

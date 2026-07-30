@@ -16,7 +16,7 @@ from app.api import chat, health, file, aiops
 from app.core.milvus_client import milvus_manager
 
 
-FRONTEND_BUILD = "20260728-alert-status-v1"
+FRONTEND_BUILD = "20260728-incident-memory-v1"
 
 
 @asynccontextmanager

@@ -126,7 +126,7 @@ class DocumentSplitterService:
         Returns:
             List[Document]: 文档分片列表
         """
-        if file_path.endswith(".md"):
+        if file_path.endswith((".md", ".markdown")):
             return self.split_markdown(content, file_path)
         else:
             return self.split_text(content, file_path)

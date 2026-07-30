@@ -1121,6 +1121,70 @@ body {
     overflow: visible;
 }
 
+.incident-memory-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+    margin-top: 20px;
+    padding-top: 14px;
+    border-top: 1px solid rgba(26, 115, 232, 0.14);
+}
+
+.incident-memory-hint {
+    color: #63758a;
+    font-size: 0.78rem;
+}
+
+.incident-memory-buttons {
+    display: flex;
+    gap: 8px;
+}
+
+.incident-memory-button {
+    min-height: 30px;
+    padding: 5px 11px;
+    border: 1px solid #cad7e6;
+    border-radius: 7px;
+    background: #fff;
+    color: #3f536b;
+    cursor: pointer;
+    font-size: 0.76rem;
+    font-weight: 550;
+    transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+.incident-memory-confirm:hover:not(:disabled) {
+    border-color: #1a73e8;
+    background: #eef5ff;
+    color: #1558b0;
+}
+
+.incident-memory-reject:hover:not(:disabled) {
+    border-color: #d36b63;
+    background: #fff4f3;
+    color: #a63f37;
+}
+
+.incident-memory-button:disabled {
+    cursor: default;
+    opacity: 0.52;
+}
+
+.incident-memory-status {
+    flex: 1 1 220px;
+    color: #71839a;
+    font-size: 0.75rem;
+}
+
+.incident-memory-status.is-success {
+    color: #218739;
+}
+
+.incident-memory-status.is-error {
+    color: #b3261e;
+}
+
 .aiops-progress-card {
     width: min(680px, 100%);
     padding: 20px;
